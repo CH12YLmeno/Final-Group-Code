@@ -1,0 +1,1039 @@
+---
+title: "Final Model Interpretation and Customer Personas"
+author: "COMM3501 Group 9"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+---
+
+```{r setup, message=FALSE, warning=FALSE}
+# ============================================================
+# 0. Setup
+# ============================================================
+
+# Required packages are intentionally standard packages already used in the
+# final clean-up file.
+library(readxl)
+library(tidyverse)
+library(janitor)
+library(lubridate)
+library(stringr)
+library(forcats)
+library(caret)
+library(pROC)
+library(randomForest)
+library(xgboost)
+library(broom)
+library(knitr)
+library(scales)
+
+SEED <- 123
+set.seed(SEED)
+
+input_file <- "/Users/ch12yl/Downloads/2026T2/COMM3501/Assignment/A3 Group/A3_Dataset_2023.xlsx"
+output_dir <- "model_outputs"
+```
+
+# Purpose Of This Interpretation File
+
+This file builds on `Final Clean Up Code.Rmd` and focuses on material needed for the final presentation:
+
+1. customer persona clustering;
+2. interpretation of Complement Naive Bayes;
+3. interpretation of Logistic Regression;
+4. interpretation of Random Forest;
+5. interpretation of XGBoost;
+6. business implications for NEOS.
+
+The original final clean-up file already fits and saves the model outputs. This file reads those outputs where possible and recreates only the clean features needed for customer clustering and model interpretation.
+
+# Load Saved Model Outputs
+
+```{r load-saved-outputs}
+model_comparison_path <- file.path(output_dir, "model_comparison.csv")
+
+if (!file.exists(model_comparison_path)) {
+  stop("model_comparison.csv was not found. Please run Final Clean Up Code.Rmd first.")
+}
+
+model_comparison <- read_csv(
+  model_comparison_path,
+  show_col_types = FALSE
+)
+
+kable(
+  model_comparison,
+  caption = "Saved model comparison from Final Clean Up Code.Rmd"
+)
+
+complement_nb_rds <- file.path(output_dir, "complement_naive_bayes_model.rds")
+logistic_rds <- file.path(output_dir, "logistic_regression_model.rds")
+random_forest_rds <- file.path(output_dir, "random_forest_model.rds")
+xgboost_rds <- file.path(output_dir, "xgboost_model.rds")
+
+saved_model_check <- tibble(
+  Model = c("Complement Naive Bayes", "Logistic Regression", "Random Forest", "XGBoost"),
+  File = c(complement_nb_rds, logistic_rds, random_forest_rds, xgboost_rds),
+  Exists = file.exists(c(complement_nb_rds, logistic_rds, random_forest_rds, xgboost_rds))
+)
+
+kable(saved_model_check, caption = "Saved model availability check")
+
+complement_naive_model <- readRDS(complement_nb_rds)
+logistic_regression_model <- readRDS(logistic_rds)
+random_forest_model <- readRDS(random_forest_rds)
+xgboost_model <- readRDS(xgboost_rds)
+```
+
+# Recreate Clean Feature Data For Interpretation
+
+```{r recreate-clean-data, message=FALSE, warning=FALSE}
+data_raw <- read_excel(input_file)
+
+data <- data_raw %>%
+  clean_names() %>%
+  mutate(
+    across(where(is.character), ~ str_squish(.)),
+    across(where(is.character), ~ na_if(., "")),
+    across(where(is.character), ~ na_if(., "[Blank]"))
+  )
+
+data_clean <- data %>%
+  mutate(
+    neos_flag = factor(
+      if_else(underwriter == "NEOS Life", "Yes", "No"),
+      levels = c("Yes", "No")
+    ),
+    life_bin = case_when(life == "Yes" ~ 1, life == "No" ~ 0, TRUE ~ NA_real_),
+    tpd_bin = case_when(tpd == "Yes" ~ 1, tpd == "No" ~ 0, TRUE ~ NA_real_),
+    trauma_bin = case_when(trauma == "Yes" ~ 1, trauma == "No" ~ 0, TRUE ~ NA_real_),
+    ip_bin = case_when(ip == "Yes" ~ 1, ip == "No" ~ 0, TRUE ~ NA_real_),
+    annual_income = if_else(annual_income < 0, NA_real_, annual_income),
+    premium = if_else(premium < 0, NA_real_, premium),
+    annualised_premium = if_else(annualised_premium < 0, NA_real_, annualised_premium),
+    inside_super_premium = if_else(inside_super_premium < 0, NA_real_, inside_super_premium),
+    outside_super_premium = if_else(outside_super_premium < 0, NA_real_, outside_super_premium),
+    product_count = rowSums(
+      across(c(life_bin, tpd_bin, trauma_bin, ip_bin), ~ replace_na(.x, 0))
+    ),
+    has_alternative = if_else(is.na(alternative), 0, 1),
+    # Product-specific cover variables match Final Clean Up Code Revised.Rmd.
+    life_cover_specific = if_else(life_bin == 1, replace_na(life_cover_amount, 0), 0),
+    tpd_cover_specific = if_else(tpd_bin == 1, replace_na(tpd_cover_amount, 0), 0),
+    trauma_cover_specific = if_else(trauma_bin == 1, replace_na(trauma_cover_amount, 0), 0),
+    ip_cover_specific = if_else(ip_bin == 1, replace_na(ip_cover_amount, 0), 0),
+    log_annual_income = log1p(annual_income),
+    log_premium = log1p(premium),
+    log_annualised_premium = log1p(annualised_premium),
+    log_life_cover = log1p(life_cover_specific),
+    log_tpd_cover = log1p(tpd_cover_specific),
+    log_trauma_cover = log1p(trauma_cover_specific),
+    log_ip_cover = log1p(ip_cover_specific),
+    product_bundle = case_when(
+      life_bin == 1 & tpd_bin == 0 & trauma_bin == 0 & ip_bin == 0 ~ "Life only",
+      life_bin == 0 & tpd_bin == 1 & trauma_bin == 0 & ip_bin == 0 ~ "TPD only",
+      life_bin == 0 & tpd_bin == 0 & trauma_bin == 1 & ip_bin == 0 ~ "Trauma only",
+      life_bin == 0 & tpd_bin == 0 & trauma_bin == 0 & ip_bin == 1 ~ "IP only",
+      life_bin == 1 & tpd_bin == 1 & trauma_bin == 0 & ip_bin == 0 ~ "Life + TPD",
+      life_bin == 1 & tpd_bin == 1 & trauma_bin == 1 & ip_bin == 0 ~ "Life + TPD + Trauma",
+      life_bin == 1 & tpd_bin == 1 & trauma_bin == 1 & ip_bin == 1 ~ "Life + TPD + Trauma + IP",
+      product_count >= 2 ~ "Other bundle",
+      TRUE ~ "Other"
+    )
+  ) %>%
+  filter(product_count > 0)
+
+# Commission structure is organised consistently with the final clean-up file.
+commission_text <- data_clean$commission_structure %>%
+  as.character() %>%
+  str_squish() %>%
+  str_to_lower() %>%
+  replace_na("unknown")
+
+c_rate <- suppressWarnings(
+  as.numeric(str_match(commission_text, "c(\\d+(?:\\.\\d+)?)")[, 2])
+)
+
+pair_rate <- str_match(
+  commission_text,
+  "(\\d+(?:\\.\\d+)?)\\s*%?\\s*/\\s*(\\d+(?:\\.\\d+)?)\\s*%?"
+)
+
+pair_initial <- suppressWarnings(as.numeric(pair_rate[, 2]))
+pair_renewal <- suppressWarnings(as.numeric(pair_rate[, 3]))
+
+init_modifier <- suppressWarnings(
+  as.numeric(
+    coalesce(
+      str_match(commission_text, "(\\d+(?:\\.\\d+)?)\\s*%?\\s*(init|initial|year1|yr1)")[, 2],
+      str_match(commission_text, "(init|initial|year1|yr1)\\s*(\\d+(?:\\.\\d+)?)\\s*%?")[, 3]
+    )
+  )
+)
+
+renew_modifier <- suppressWarnings(
+  as.numeric(
+    coalesce(
+      str_match(commission_text, "(\\d+(?:\\.\\d+)?)\\s*%?\\s*(renew|renewal|year2|yr2)")[, 2],
+      str_match(commission_text, "(renew|renewal|year2|yr2)\\s*(\\d+(?:\\.\\d+)?)\\s*%?")[, 3]
+    )
+  )
+)
+
+commission_type <- case_when(
+  commission_text == "unknown" ~ "Unknown",
+  str_detect(commission_text, "nil|nill|no commission|nil commission") ~ "No commission",
+  str_detect(commission_text, "level|l2evel|0% level") ~ "Level",
+  str_detect(commission_text, "upfront|higher initial|standard - upfront|initial \\(") ~ "Upfront / Higher initial",
+  str_detect(commission_text, "hybrid|h4ybrid|h3ybrid|h2ybrid|hybrid60|hybrid70|hybrid80") ~ "Hybrid",
+  TRUE ~ "Other specified"
+)
+
+base_initial <- case_when(
+  commission_type == "Unknown" ~ NA_real_,
+  commission_type == "No commission" ~ 0,
+  commission_type == "Level" ~ 33,
+  str_detect(commission_text, "2018|hybrid80|88\\s*/\\s*22") ~ 88,
+  str_detect(commission_text, "2019|hybrid70|77\\s*/\\s*22") ~ 77,
+  commission_type %in% c("Hybrid", "Upfront / Higher initial") ~ 66,
+  TRUE ~ NA_real_
+)
+
+base_renewal <- case_when(
+  commission_type == "Unknown" ~ NA_real_,
+  commission_type == "No commission" ~ 0,
+  commission_type == "Level" ~ 33,
+  commission_type %in% c("Hybrid", "Upfront / Higher initial") ~ 22,
+  TRUE ~ NA_real_
+)
+
+has_modifier_words <- str_detect(
+  commission_text,
+  "init|initial|renew|renewal|year1|year2"
+)
+
+use_pair_as_modifier <- has_modifier_words &
+  !str_detect(commission_text, "yr1\\s*66|year1\\s*66|yr2\\s*22|year2\\s*22") &
+  !is.na(pair_initial) &
+  !is.na(pair_renewal) &
+  pair_initial <= 100 &
+  pair_renewal <= 100
+
+initial_rate <- case_when(
+  commission_type == "Unknown" ~ NA_real_,
+  commission_type == "No commission" ~ 0,
+  !is.na(c_rate) ~ base_initial * c_rate / 100,
+  !is.na(init_modifier) ~ base_initial * init_modifier / 100,
+  use_pair_as_modifier ~ base_initial * pair_initial / 100,
+  !is.na(pair_initial) ~ pair_initial,
+  commission_type %in% c("Hybrid", "Upfront / Higher initial", "Level") ~ base_initial,
+  TRUE ~ NA_real_
+)
+
+renewal_rate <- case_when(
+  commission_type == "Unknown" ~ NA_real_,
+  commission_type == "No commission" ~ 0,
+  !is.na(c_rate) ~ base_renewal * c_rate / 100,
+  !is.na(renew_modifier) ~ base_renewal * renew_modifier / 100,
+  use_pair_as_modifier ~ base_renewal * pair_renewal / 100,
+  !is.na(pair_renewal) ~ pair_renewal,
+  commission_type %in% c("Hybrid", "Upfront / Higher initial", "Level") ~ base_renewal,
+  TRUE ~ NA_real_
+)
+
+data_clean <- data_clean %>%
+  mutate(
+    commission_type = factor(commission_type),
+    initial_rate_numeric = initial_rate,
+    renewal_rate_numeric = renewal_rate,
+    initial_commission_rate_gst = factor(case_when(
+      commission_text == "unknown" ~ "Unknown",
+      is.na(initial_rate) ~ "Not stated in label",
+      TRUE ~ paste0(round(initial_rate, 2), "%")
+    )),
+    renewal_commission_rate_gst = factor(case_when(
+      commission_text == "unknown" ~ "Unknown",
+      is.na(renewal_rate) ~ "Not stated in label",
+      TRUE ~ paste0(round(renewal_rate, 2), "%")
+    )),
+    occupation_text = str_to_lower(as.character(occupation)),
+    occupation_category = case_when(
+      str_detect(occupation_text, "home duties|retired|student|unemployed") ~ "Home / retired / student",
+      str_detect(occupation_text, "doctor|medical|nurse|dentist|physio|psychologist|pharmacist|veterinary|surgeon|therapist|paramedic") ~ "Healthcare professional",
+      str_detect(occupation_text, "teacher|education|lecturer|academic|child care|teachers aide") ~ "Education / childcare",
+      str_detect(occupation_text, "lawyer|solicitor|legal|accountant|architect|engineer|computer|programmer|analyst|consultant|actuary|scientist") ~ "Professional / technical",
+      str_detect(occupation_text, "manager|management|chief executive|project manager|business development") ~ "Management",
+      str_detect(occupation_text, "clerical|administration|clerk|receptionist|bookkeeper|office|bank") ~ "Clerical / administration",
+      str_detect(occupation_text, "sales|real estate|retail|marketing") ~ "Sales / marketing",
+      str_detect(occupation_text, "electrician|plumber|carpenter|builder|mechanic|fitter|cabinet|chef|hairdresser|trade|construction|foreman") ~ "Trade / skilled manual",
+      str_detect(occupation_text, "driver|truck|mining|farming|police|fire|security|plant operator|manual|blue collar|heavy") ~ "Manual / field / higher risk",
+      str_detect(occupation_text, "1a|1b|white collar|1p|1l|1m") ~ "Professional / technical",
+      str_detect(occupation_text, "2a|2b|2c") ~ "White collar / clerical",
+      str_detect(occupation_text, "3a|3b|3m|\\b4\\b|\\b5\\b") ~ "Manual / field / higher risk",
+      TRUE ~ "Other"
+    ),
+    occupation_grouped = fct_lump_min(
+      as.factor(replace_na(as.character(occupation), "Unknown")),
+      min = 50,
+      other_level = "Other occupation"
+    ),
+    across(
+      c(gender, smoker_status, home_state, self_employed,
+        product_bundle, commission_type, occupation_category, occupation_grouped,
+        premium_frequency, super, rollover_tax_rebate),
+      as.factor
+    )
+  )
+```
+
+# Model Performance Interpretation
+
+```{r model-performance-interpretation}
+selected_models <- model_comparison %>%
+  filter(
+    Model %in% c(
+      "Complement Naive Bayes",
+      "Logistic Regression",
+      "Random Forest",
+      "XGBoost"
+    )
+  ) %>%
+  arrange(desc(AUC))
+
+kable(
+  selected_models,
+  caption = "Models selected for detailed interpretation"
+)
+```
+
+**Interpretation for the final presentation:**
+
+- **Complement Naive Bayes** is useful when the minority class matters because it adjusts the standard Naive Bayes idea by learning from the complement of each class. In this project, it helps address the imbalance between NEOS and non-NEOS recommendations.
+- **Logistic Regression** provides interpretability. It explains whether each variable increases or decreases the odds of a NEOS recommendation, holding other variables constant.
+- **Random Forest** is useful for predictive strength and non-linear relationships. It can capture interactions between customer profile, product features, and commission structure without requiring those relationships to be manually specified.
+- **XGBoost** is a boosted tree model. It is useful for ranking recommendation opportunities because it builds many small trees sequentially and focuses more on cases that previous trees classified poorly.
+
+# Complement Naive Bayes Interpretation
+
+```{r complement-naive-interpretation}
+complement_nb_performance <- model_comparison %>%
+  filter(Model == "Complement Naive Bayes")
+
+kable(
+  complement_nb_performance,
+  caption = "Complement Naive Bayes performance"
+)
+
+complement_nb_top_features <- complement_naive_model$log_theta %>%
+  group_by(Class) %>%
+  slice_max(order_by = abs(Log_Theta), n = 10, with_ties = FALSE) %>%
+  ungroup() %>%
+  arrange(Class, desc(abs(Log_Theta)))
+
+kable(
+  complement_nb_top_features,
+  caption = "Complement Naive Bayes high-influence encoded features"
+)
+```
+
+**Presentation wording:**
+
+Complement Naive Bayes acts as a robust benchmark classifier for imbalanced data. A strong result from this model suggests that the NEOS recommendation signal is present across combinations of customer, product, and adviser-related variables rather than depending on one single predictor. If its sensitivity is high but precision is lower than Random Forest or KNN, it should be interpreted as a broad screening model: it is good at finding potential NEOS opportunities but may also flag too many non-NEOS cases.
+
+# Logistic Regression Interpretation
+
+```{r logistic-interpretation}
+logistic_terms <- broom::tidy(
+  logistic_regression_model,
+  conf.int = FALSE
+) %>%
+  filter(term != "(Intercept)") %>%
+  mutate(
+    Odds_Ratio = exp(estimate),
+    Direction = case_when(
+      Odds_Ratio > 1 ~ "Increases odds of NEOS",
+      Odds_Ratio < 1 ~ "Decreases odds of NEOS",
+      TRUE ~ "Neutral"
+    )
+  ) %>%
+  arrange(p.value)
+
+logistic_top_terms <- logistic_terms %>%
+  slice_head(n = 15) %>%
+  dplyr::select(
+    term,
+    estimate,
+    Odds_Ratio,
+    p.value,
+    Direction
+  )
+
+kable(
+  logistic_top_terms,
+  digits = 4,
+  caption = "Top logistic regression terms by p-value"
+)
+
+logistic_direction_summary <- logistic_terms %>%
+  count(Direction)
+
+kable(
+  logistic_direction_summary,
+  caption = "Logistic regression direction summary"
+)
+```
+
+```{r logistic-plot, fig.height=5, fig.width=8}
+logistic_top_terms %>%
+  mutate(
+    term = fct_reorder(term, Odds_Ratio)
+  ) %>%
+  ggplot(aes(x = term, y = Odds_Ratio, fill = Direction)) +
+  geom_col(alpha = 0.9) +
+  geom_hline(yintercept = 1, linetype = "dashed", colour = "grey45") +
+  coord_flip() +
+  scale_fill_manual(
+    values = c(
+      "Increases odds of NEOS" = "#5D3FD3",
+      "Decreases odds of NEOS" = "#FFD700",
+      "Neutral" = "grey70"
+    )
+  ) +
+  labs(
+    title = "Logistic Regression: Key Odds Ratios",
+    x = "Predictor",
+    y = "Odds ratio",
+    fill = "Direction"
+  ) +
+  theme_minimal()
+```
+
+**Presentation wording:**
+
+Logistic Regression is the most explainable classification model. Coefficients above an odds ratio of 1 indicate profiles associated with higher odds of a NEOS recommendation. Coefficients below 1 indicate profiles less associated with NEOS. This model is useful for explaining *why* some adviser/customer/product combinations are more likely to align with NEOS, even if another model has stronger predictive performance.
+
+**More detailed interpretation:**
+
+- Logistic Regression should be treated as the **interpretability model**. It is less flexible than tree-based methods, but it gives clear directional evidence through odds ratios.
+- An odds ratio above 1 means the feature is associated with a higher likelihood of a NEOS recommendation. For example, if a product, premium, cover, or customer category has an odds ratio above 1, that profile is more aligned with NEOS recommendation behaviour.
+- An odds ratio below 1 means the feature is associated with a lower likelihood of NEOS being recommended. These profiles may represent segments where competitors are stronger or where NEOS positioning is less attractive.
+- Because the model assumes a linear relationship on the log-odds scale, it is useful for communication and hypothesis generation, not necessarily as the strongest predictive model.
+- In business terms, Logistic Regression helps answer: **which adviser/customer/product characteristics push the recommendation toward or away from NEOS?**
+
+# Random Forest Interpretation
+
+```{r random-forest-interpretation}
+rf_importance <- if (inherits(random_forest_model, "train")) {
+  varImp(random_forest_model)$importance %>%
+    as.data.frame() %>%
+    rownames_to_column("Variable")
+} else {
+  importance(random_forest_model) %>%
+    as.data.frame() %>%
+    rownames_to_column("Variable")
+}
+
+importance_column <- case_when(
+  "Overall" %in% names(rf_importance) ~ "Overall",
+  "MeanDecreaseGini" %in% names(rf_importance) ~ "MeanDecreaseGini",
+  TRUE ~ names(rf_importance)[ncol(rf_importance)]
+)
+
+rf_top_importance <- rf_importance %>%
+  arrange(desc(.data[[importance_column]])) %>%
+  slice_head(n = 15)
+
+kable(
+  rf_top_importance,
+  digits = 4,
+  caption = "Random Forest top variable importance"
+)
+```
+
+```{r random-forest-plot, fig.height=5, fig.width=8}
+rf_top_importance %>%
+  mutate(
+    Variable = fct_reorder(Variable, .data[[importance_column]])
+  ) %>%
+  ggplot(aes(x = Variable, y = .data[[importance_column]])) +
+  geom_col(fill = "#483248", alpha = 0.9) +
+  coord_flip() +
+  labs(
+    title = "Random Forest: Most Important Predictors",
+    x = "Predictor",
+    y = importance_column
+  ) +
+  theme_minimal()
+```
+
+**Presentation wording:**
+
+Random Forest provides a strong predictive model because it captures non-linear patterns and interactions. Its variable importance output identifies which customer, product, premium, and cover features are most useful for separating NEOS from non-NEOS recommendations. This model is especially valuable for business targeting because it can rank the drivers of recommendation likelihood without assuming a simple linear relationship.
+
+**More detailed interpretation:**
+
+- Random Forest should be treated as the **pattern discovery and targeting model**. It can capture interactions that Logistic Regression may miss, such as product bundle effects that only matter for certain age, occupation, income, or premium groups.
+- Variables with high importance are not automatically causal drivers, but they are strong signals the model used to distinguish NEOS from non-NEOS recommendations.
+- If product, premium, or cover variables appear near the top of the importance table, this indicates that adviser recommendations are not driven only by customer demographics. The product offer and recommendation structure also matter.
+- If customer profile variables appear strongly, NEOS can use those segments for adviser education, targeting, and product positioning.
+- In business terms, Random Forest helps answer: **which features are most useful for identifying high-probability NEOS recommendation opportunities?**
+- Compared with Logistic Regression, Random Forest is less transparent but more flexible. Therefore, it is best used together with Logistic Regression: Random Forest for ranking and targeting, Logistic Regression for explanation.
+
+# XGBoost Interpretation
+
+```{r xgboost-interpretation}
+xgboost_performance <- model_comparison %>%
+  filter(Model == "XGBoost")
+
+kable(
+  xgboost_performance,
+  digits = 4,
+  caption = "XGBoost performance"
+)
+
+xgboost_importance <- if (inherits(xgboost_model, "train")) {
+  varImp(xgboost_model)$importance %>%
+    as.data.frame() %>%
+    rownames_to_column("Feature") %>%
+    rename(Gain = Overall)
+} else {
+  xgb.importance(
+    model = xgboost_model
+  ) %>%
+    as_tibble()
+}
+
+xgboost_importance <- xgboost_importance %>%
+  filter(
+    !str_detect(
+      str_to_lower(Feature),
+      "commission|initial_rate|renewal_rate"
+    )
+  )
+
+xgboost_top_importance <- xgboost_importance %>%
+  arrange(desc(Gain)) %>%
+  slice_head(n = 15)
+
+kable(
+  xgboost_top_importance,
+  digits = 4,
+  caption = "XGBoost top variable importance"
+)
+```
+
+```{r xgboost-plot, fig.height=5, fig.width=8}
+xgboost_top_importance %>%
+  mutate(
+    Feature = fct_reorder(Feature, Gain)
+  ) %>%
+  ggplot(aes(x = Feature, y = Gain)) +
+  geom_col(fill = "#5D3FD3", alpha = 0.9) +
+  coord_flip() +
+  labs(
+    title = "XGBoost: Most Important Predictors",
+    x = "Predictor",
+    y = "Gain"
+  ) +
+  theme_minimal()
+```
+
+**Presentation wording:**
+
+XGBoost is a powerful boosted-tree model that captures complex non-linear patterns. In this project, it provides a useful comparison against Random Forest because both are tree-based models, but XGBoost learns sequentially by improving on previous errors. Its AUC shows how well it ranks NEOS recommendations above non-NEOS recommendations, while the confusion matrix metrics show whether that ranking converts into useful class decisions at the chosen probability threshold.
+
+**More detailed interpretation:**
+
+- XGBoost should be interpreted as a **ranking and prioritisation model**. A reasonable AUC means it can still rank higher-probability NEOS opportunities even when the default classification threshold produces low sensitivity.
+- If XGBoost has high specificity but low sensitivity, it is conservative: it avoids incorrectly labelling many non-NEOS cases as NEOS, but it misses many actual NEOS recommendations.
+- This pattern is common in imbalanced data because the model can achieve strong overall accuracy by favouring the majority class. Therefore, AUC, balanced accuracy, sensitivity, and lift should be considered together rather than relying only on accuracy.
+- The Gain-based importance table shows which variables most improve the model's splits. Commission variables are excluded from the XGBoost interpretation, so features such as premium, age, income, cover amount, product indicators, and state should be interpreted as the key non-commission signals for ranking likely NEOS recommendation opportunities.
+- In business terms, XGBoost helps answer: **which recommendation profiles should NEOS prioritise when the goal is ranking high-probability opportunities rather than simply explaining individual coefficients?**
+- Compared with Random Forest, XGBoost may provide sharper ranking performance, but it is less intuitive to explain. For the final presentation, it works best as a high-performance comparison model supported by a simple variable-importance chart.
+
+# Customer Persona Clustering
+
+```{r clustering-preparation}
+# The target variable is kept outside the clustering feature data.
+# It is joined back only after clusters are created, so the clustering model
+# does not learn directly from the NEOS outcome.
+data_clean <- data_clean %>%
+  mutate(
+    occupation_text = str_to_lower(as.character(occupation)),
+    occupation_category = case_when(
+      str_detect(occupation_text, "home duties|retired|student|unemployed") ~ "Home / retired / student",
+      str_detect(occupation_text, "doctor|medical|nurse|dentist|physio|psychologist|pharmacist|surgeon|therapist|paramedic") ~ "Healthcare professional",
+      str_detect(occupation_text, "teacher|education|lecturer|academic|child care") ~ "Education / childcare",
+      str_detect(occupation_text, "lawyer|solicitor|legal|accountant|architect|engineer|computer|programmer|analyst|consultant|actuary|scientist") ~ "Professional / technical",
+      str_detect(occupation_text, "manager|management|chief executive|project manager|business development") ~ "Management",
+      str_detect(occupation_text, "clerical|administration|clerk|receptionist|bookkeeper|office|bank") ~ "Clerical / administration",
+      str_detect(occupation_text, "sales|real estate|retail|marketing") ~ "Sales / marketing",
+      str_detect(occupation_text, "electrician|plumber|carpenter|builder|mechanic|fitter|chef|hairdresser|trade|construction") ~ "Trade / skilled manual",
+      str_detect(occupation_text, "driver|truck|mining|farming|police|fire|security|plant operator|manual|blue collar|heavy") ~ "Manual / field / higher risk",
+      TRUE ~ "Other"
+    ),
+    occupation_category = fct_lump_min(
+      as.factor(occupation_category),
+      min = 50,
+      other_level = "Other"
+    )
+  )
+
+cluster_target <- data_clean %>%
+  mutate(cluster_row_id = row_number()) %>%
+  dplyr::select(
+    cluster_row_id,
+    neos_flag
+  )
+
+cluster_base <- data_clean %>%
+  mutate(cluster_row_id = row_number()) %>%
+  dplyr::select(
+    cluster_row_id,
+    age_next,
+    annual_income,
+    log_annual_income,
+    log_annualised_premium,
+    log_life_cover,
+    log_tpd_cover,
+    log_trauma_cover,
+    log_ip_cover,
+    product_count,
+    life_bin,
+    tpd_bin,
+    trauma_bin,
+    ip_bin,
+    has_alternative,
+    gender,
+    home_state,
+    self_employed,
+    occupation,
+    occupation_category,
+    product_bundle,
+    premium_frequency,
+    super
+  ) %>%
+  drop_na(
+    age_next,
+    log_annual_income,
+    log_annualised_premium,
+    log_life_cover,
+    log_tpd_cover,
+    log_trauma_cover,
+    log_ip_cover,
+    product_count,
+    life_bin,
+    tpd_bin,
+    trauma_bin,
+    ip_bin,
+    has_alternative
+  )
+
+# Cap the clustering sample for speed. Sampling is random and does not use
+# the NEOS target variable.
+set.seed(SEED)
+cluster_sample <- cluster_base %>%
+  slice_sample(n = min(30000, nrow(cluster_base)))
+
+cluster_feature_data <- cluster_sample %>%
+  dplyr::select(
+    -cluster_row_id,
+    -annual_income,
+    -occupation
+  ) %>%
+  mutate(
+    across(where(is.factor), ~ fct_na_value_to_level(.x, "Unknown")),
+    across(where(is.character), ~ replace_na(.x, "Unknown"))
+  )
+
+cluster_feature_audit <- tibble(
+  Feature_Group = c(
+    "Demographics",
+    "Income and premium",
+    "Product indicators",
+    "Product-specific cover",
+    "Recommendation profile",
+    "Excluded from clustering"
+  ),
+  Variables = c(
+    "age_next, gender, home_state, self_employed, occupation_category",
+    "log_annual_income, log_annualised_premium",
+    "life_bin, tpd_bin, trauma_bin, ip_bin, product_count, product_bundle",
+    "log_life_cover, log_tpd_cover, log_trauma_cover, log_ip_cover",
+    "has_alternative, premium_frequency, super",
+    "neos_flag, commission variables, raw IDs, original occupation text"
+  )
+)
+
+kable(
+  cluster_feature_audit,
+  caption = "Clustering feature design"
+)
+
+# Include categorical profile variables by converting them into dummy variables.
+# The NEOS target is not included in this feature matrix.
+cluster_dummy_model <- dummyVars(
+  ~ .,
+  data = cluster_feature_data,
+  fullRank = TRUE
+)
+
+cluster_matrix <- predict(
+  cluster_dummy_model,
+  newdata = cluster_feature_data
+) %>%
+  as.data.frame()
+
+cluster_matrix[is.na(cluster_matrix)] <- 0
+
+near_zero_columns <- nearZeroVar(cluster_matrix)
+
+if (length(near_zero_columns) > 0) {
+  cluster_matrix <- cluster_matrix[, -near_zero_columns, drop = FALSE]
+}
+
+cluster_cor_matrix <- cor(cluster_matrix)
+cluster_cor_matrix[is.na(cluster_cor_matrix)] <- 0
+
+high_correlation_columns <- findCorrelation(
+  cluster_cor_matrix,
+  cutoff = 0.90,
+  names = TRUE
+)
+
+if (length(high_correlation_columns) > 0) {
+  cluster_matrix <- cluster_matrix[
+    ,
+    !names(cluster_matrix) %in% high_correlation_columns,
+    drop = FALSE
+  ]
+}
+
+cluster_scaled <- scale(cluster_matrix)
+cluster_scaled[is.na(cluster_scaled)] <- 0
+
+set.seed(SEED)
+cluster_k_sample_size <- min(3000, nrow(cluster_scaled))
+cluster_k_index <- sample(seq_len(nrow(cluster_scaled)), cluster_k_sample_size)
+cluster_scaled_k_search <- cluster_scaled[cluster_k_index, , drop = FALSE]
+
+k_search_table <- tibble(k = 3:8) %>%
+  mutate(
+    kmeans_model = map(
+      k,
+      ~ kmeans(
+        cluster_scaled_k_search,
+        centers = .x,
+        nstart = 10,
+        iter.max = 50
+      )
+    ),
+    total_withinss = map_dbl(kmeans_model, "tot.withinss"),
+    avg_silhouette = map2_dbl(
+      kmeans_model,
+      k,
+      ~ mean(
+        cluster::silhouette(
+          .x$cluster,
+          dist(cluster_scaled_k_search)
+        )[, "sil_width"]
+      )
+    )
+  ) %>%
+  dplyr::select(
+    k,
+    total_withinss,
+    avg_silhouette
+  )
+
+best_cluster_k <- k_search_table %>%
+  arrange(desc(avg_silhouette)) %>%
+  slice_head(n = 1) %>%
+  pull(k)
+
+kable(
+  k_search_table,
+  digits = 4,
+  caption = "Best cluster number check using within-cluster sum of squares and silhouette score"
+)
+
+best_cluster_k
+```
+
+```{r clustering-k-plot, fig.height=4, fig.width=8}
+k_search_table %>%
+  ggplot(aes(x = k, y = avg_silhouette)) +
+  geom_line(colour = "#483248", linewidth = 1.1) +
+  geom_point(colour = "#483248", fill = "#FFD700", size = 3, shape = 21) +
+  scale_x_continuous(breaks = k_search_table$k) +
+  labs(
+    title = "Choosing The Number Of Customer Persona Clusters",
+    subtitle = "Higher average silhouette indicates clearer separation between clusters",
+    x = "Number of clusters (k)",
+    y = "Average silhouette score"
+  ) +
+  theme_minimal()
+```
+
+```{r clustering-model}
+# The final number of clusters is selected by the silhouette check above.
+set.seed(SEED)
+cluster_model <- kmeans(
+  cluster_scaled,
+  centers = best_cluster_k,
+  nstart = 25,
+  iter.max = 100
+)
+
+cluster_results <- cluster_sample %>%
+  mutate(
+    cluster = factor(cluster_model$cluster)
+  ) %>%
+  left_join(cluster_target, by = "cluster_row_id")
+
+mode_value <- function(x) {
+  x <- x[!is.na(x)]
+  if (length(x) == 0) return(NA_character_)
+  names(sort(table(x), decreasing = TRUE))[1]
+}
+
+cluster_personas <- cluster_results %>%
+  group_by(cluster) %>%
+  summarise(
+    Records = n(),
+    Share_Of_Sample = Records / nrow(cluster_results),
+    NEOS_Rate = mean(neos_flag == "Yes"),
+    Median_Age = median(age_next, na.rm = TRUE),
+    Median_Income = median(annual_income, na.rm = TRUE),
+    Median_Annualised_Premium = median(expm1(log_annualised_premium), na.rm = TRUE),
+    Median_Life_Cover = median(expm1(log_life_cover), na.rm = TRUE),
+    Median_TPD_Cover = median(expm1(log_tpd_cover), na.rm = TRUE),
+    Median_Trauma_Cover = median(expm1(log_trauma_cover), na.rm = TRUE),
+    Median_IP_Cover = median(expm1(log_ip_cover), na.rm = TRUE),
+    Average_Product_Count = mean(product_count, na.rm = TRUE),
+    Life_Rate = mean(life_bin == 1, na.rm = TRUE),
+    TPD_Rate = mean(tpd_bin == 1, na.rm = TRUE),
+    Trauma_Rate = mean(trauma_bin == 1, na.rm = TRUE),
+    IP_Rate = mean(ip_bin == 1, na.rm = TRUE),
+    Male_Rate = mean(gender == "Male", na.rm = TRUE),
+    Top_Occupation_Category = mode_value(occupation_category),
+    Top_Product_Bundle = mode_value(product_bundle),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    NEOS_Uplift = NEOS_Rate / mean(cluster_results$neos_flag == "Yes"),
+    Persona_Label = case_when(
+      Top_Product_Bundle == "Life + TPD + Trauma + IP" ~ "Comprehensive Protection Opportunity",
+      Top_Product_Bundle == "Life + TPD + Trauma" ~ "Bundled Lump-Sum Protection Segment",
+      Top_Product_Bundle == "Life + TPD" ~ "Life And Disability Foundation Segment",
+      Top_Product_Bundle == "Life only" ~ "Mature Life Cover Segment",
+      Top_Product_Bundle == "Trauma only" ~ "Trauma Protection Segment",
+      Top_Product_Bundle == "IP only" ~ "Income Protection Specialist Segment",
+      Top_Product_Bundle == "Other bundle" ~ "Mixed Cover Growth Segment",
+      TRUE ~ "General Protection Segment"
+    )
+  ) %>%
+  relocate(Persona_Label, .after = cluster)
+
+kable(
+  cluster_personas,
+  digits = 3,
+  caption = "Customer persona clusters"
+)
+```
+
+```{r other-occupation-insight}
+other_occupation_insight <- cluster_results %>%
+  filter(occupation_category == "Other") %>%
+  count(occupation, sort = TRUE) %>%
+  mutate(
+    Share_Within_Other = n / sum(n)
+  ) %>%
+  left_join(
+    cluster_results %>%
+      filter(occupation_category == "Other") %>%
+      group_by(occupation) %>%
+      summarise(
+        NEOS_Rate = mean(neos_flag == "Yes"),
+        .groups = "drop"
+      ),
+    by = "occupation"
+  ) %>%
+  slice_head(n = 15)
+
+kable(
+  other_occupation_insight,
+  digits = 3,
+  caption = "Most common original occupations inside Other occupation category"
+)
+```
+
+```{r clustering-confusion-matrix}
+# Clustering is unsupervised, so this is not a true supervised model test.
+# For imbalanced data, majority-class mapping can label every cluster as "No".
+# Here, clusters above the overall NEOS rate are treated as high-NEOS opportunities.
+overall_neos_rate <- mean(cluster_results$neos_flag == "Yes")
+minimum_cluster_share <- 0.02
+minimum_neos_uplift <- 1.10
+
+cluster_class_map <- cluster_personas %>%
+  transmute(
+    cluster,
+    NEOS_Rate,
+    NEOS_Uplift,
+    Share_Of_Sample,
+    cluster_predicted_class = factor(
+      if_else(
+        NEOS_Rate >= overall_neos_rate * minimum_neos_uplift &
+          Share_Of_Sample >= minimum_cluster_share,
+        "Yes",
+        "No"
+      ),
+      levels = c("Yes", "No")
+    )
+  )
+
+cluster_classification <- cluster_results %>%
+  left_join(cluster_class_map, by = "cluster") %>%
+  mutate(
+    neos_flag = factor(neos_flag, levels = c("Yes", "No"))
+  )
+
+cluster_confusion_matrix <- confusionMatrix(
+  data = cluster_classification$cluster_predicted_class,
+  reference = cluster_classification$neos_flag,
+  positive = "Yes"
+)
+
+cluster_confusion_summary <- tibble(
+  Accuracy = as.numeric(cluster_confusion_matrix$overall["Accuracy"]),
+  Sensitivity = as.numeric(cluster_confusion_matrix$byClass["Sensitivity"]),
+  Specificity = as.numeric(cluster_confusion_matrix$byClass["Specificity"]),
+  Precision = as.numeric(cluster_confusion_matrix$byClass["Pos Pred Value"]),
+  F1 = as.numeric(cluster_confusion_matrix$byClass["F1"]),
+  Balanced_Accuracy = as.numeric(cluster_confusion_matrix$byClass["Balanced Accuracy"])
+)
+
+kable(cluster_class_map, digits = 3, caption = "Cluster opportunity labels")
+
+cluster_opportunity_rule <- tibble(
+  Rule = c(
+    "Overall NEOS rate",
+    "Minimum cluster size",
+    "High-opportunity uplift threshold"
+  ),
+  Value = c(
+    percent(overall_neos_rate, accuracy = 0.1),
+    percent(minimum_cluster_share, accuracy = 0.1),
+    paste0(minimum_neos_uplift, "x overall NEOS rate")
+  )
+)
+
+kable(
+  cluster_opportunity_rule,
+  caption = "Cluster high-opportunity labelling rule"
+)
+
+kable(
+  cluster_confusion_summary,
+  digits = 4,
+  caption = "Cluster high-NEOS opportunity check"
+)
+```
+
+```{r clustering-plot, fig.height=5, fig.width=8}
+cluster_personas %>%
+  ggplot(aes(x = cluster, y = NEOS_Rate, fill = Persona_Label)) +
+  geom_col(alpha = 0.9) +
+  scale_y_continuous(labels = percent_format()) +
+  scale_fill_manual(
+    values = c(
+      "Comprehensive Protection Opportunity" = "#483248",
+      "Bundled Lump-Sum Protection Segment" = "#5D3FD3",
+      "Life And Disability Foundation Segment" = "#B57EDC",
+      "Mature Life Cover Segment" = "#7E57C2",
+      "Trauma Protection Segment" = "#9575CD",
+      "Income Protection Specialist Segment" = "#FFD700",
+      "Mixed Cover Growth Segment" = "#6A1B9A",
+      "General Protection Segment" = "grey70"
+    )
+  ) +
+  labs(
+    title = "NEOS Recommendation Rate By Customer Persona Cluster",
+    x = "Cluster",
+    y = "NEOS recommendation rate",
+    fill = "Persona"
+  ) +
+  theme_minimal()
+```
+
+**Presentation wording:**
+
+The clustering model is used as an unsupervised segmentation tool, not as the final prediction model. It groups similar customer and product profiles into personas, then compares each persona with the observed NEOS recommendation rate. The clustering uses product-specific cover fields for Life, TPD, Trauma and IP instead of one combined total cover, because IP cover is periodic while the other products are lump-sum style covers. The model deliberately excludes the NEOS target and commission variables, reducing leakage risk and keeping the personas focused on customer/product characteristics.
+
+**How to interpret the clustering confusion matrix:**
+
+The confusion matrix is an opportunity-check only. It should not be presented as the same type of model evaluation used for Random Forest, Logistic Regression, or Naive Bayes. The clusters were created without using `neos_flag`. After clustering, a cluster is labelled as a high-NEOS opportunity only if its NEOS rate is at least 1.10 times the overall NEOS rate and the cluster contains at least 2% of the sample.
+
+- Higher sensitivity means the high-opportunity personas capture more of the actual NEOS recommendations.
+- Low precision means those personas still include many non-NEOS cases, so they are useful for broad targeting but not precise enough for individual-level prediction.
+- Balanced accuracy is more useful than raw accuracy because NEOS is the minority class.
+- The real value of clustering is interpretation: it helps translate model outputs into adviser-facing customer/product segments.
+
+# Business Interpretation Summary
+
+```{r interpretation-summary}
+best_classification_model <- model_comparison %>%
+  arrange(desc(AUC)) %>%
+  slice_head(n = 1) %>%
+  pull(Model)
+
+highest_neos_cluster <- cluster_personas %>%
+  arrange(desc(NEOS_Rate)) %>%
+  slice_head(n = 1)
+
+interpretation_summary <- tibble(
+  Area = c(
+    "Complement Naive Bayes",
+    "Logistic Regression",
+    "Random Forest",
+    "XGBoost",
+    "Clustering"
+  ),
+  Role_In_Project = c(
+    "Benchmark model designed to be more robust for imbalanced classification",
+    "Explainable model for direction and odds of NEOS recommendation",
+    "Strong predictive model for non-linear customer/product/adviser patterns",
+    "Boosted tree model for ranking high-probability recommendation opportunities",
+    "Unsupervised customer/product persona model for segment interpretation"
+  ),
+  Business_Use = c(
+    "Broad screening of possible NEOS opportunities",
+    "Explains which variables increase or decrease NEOS likelihood",
+    "Ranks important drivers for targeting and adviser strategy",
+    "Prioritises opportunities using complex interactions and variable importance",
+    paste0(
+      "Identifies high-value persona groups; highest observed NEOS-rate cluster is Cluster ",
+      highest_neos_cluster$cluster
+    )
+  )
+)
+
+kable(
+  interpretation_summary,
+  caption = "Interpretation summary for final presentation"
+)
+```
+
+# Suggested Presentation Talking Points
+
+1. **Classification goal:** identify adviser, customer, and product profiles with higher probability of a NEOS recommendation.
+2. **Complement Naive Bayes:** useful benchmark for imbalanced data; strong for broad opportunity screening.
+3. **Logistic Regression:** useful for interpretation; odds ratios explain the direction of each driver.
+4. **Random Forest:** useful for business targeting; importance scores identify the strongest drivers.
+5. **XGBoost:** useful for ranking and prioritisation; Gain importance shows which variables most improve prediction.
+6. **Clustering:** converts customer/product profiles into personas, making the insights easier for managers and advisers to act on.
+7. **Recommendation:** use predictive models to prioritise high-probability NEOS opportunities, then use persona clusters to tailor adviser engagement and product messaging.
