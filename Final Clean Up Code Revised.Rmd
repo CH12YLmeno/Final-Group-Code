@@ -1,0 +1,1653 @@
+---
+title: "Final Clean Up Code Revised"
+author: "COMM3501"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+---
+
+```{r setup, message=FALSE, warning=FALSE}
+# ============================================================
+# 0. Setup
+# ============================================================
+
+# If any package is missing, install it once in the Console, for example:
+# install.packages(c("readxl", "tidyverse", "janitor", "lubridate",
+#                    "caret", "pROC", "e1071", "kknn", "rpart",
+#                    "randomForest", "xgboost", "class", "knitr"))
+
+library(readxl)
+library(tidyverse)
+library(janitor)
+library(lubridate)
+library(stringr)
+library(forcats)
+library(caret)
+library(pROC)
+library(e1071)
+library(kknn)
+library(rpart)
+library(randomForest)
+library(xgboost)
+library(class)
+library(knitr)
+
+SEED <- 123
+TRAIN_PROPORTION <- 0.70
+CLASSIFICATION_THRESHOLD <- 0.50
+
+set.seed(SEED)
+
+# Mac-safe absolute path. Change this if your file moves.
+input_file <- "/Users/ch12yl/Downloads/2026T2/COMM3501/Assignment/A3 Group/A3_Dataset_2023.xlsx"
+
+# Outputs will be saved beside this Rmd after knitting.
+output_dir <- "model_outputs"
+dir.create(output_dir, showWarnings = FALSE)
+```
+
+# Data Check
+
+```{r data-check}
+file.exists(input_file)
+
+data_raw <- read_excel(input_file)
+
+data_check <- tibble(
+  Check = c(
+    "Excel file exists",
+    "Excel file opens in R on Mac",
+    "Raw rows",
+    "Raw columns"
+  ),
+  Result = c(
+    ifelse(file.exists(input_file), "Pass", "Fail"),
+    "Pass",
+    nrow(data_raw),
+    ncol(data_raw)
+  )
+)
+
+kable(data_check)
+```
+
+# Clean Data
+
+```{r clean-data, message=FALSE, warning=FALSE}
+# 1. Clean column names and text
+data <- data_raw %>%
+  clean_names() %>%
+  mutate(
+    across(where(is.character), ~ str_squish(.)),
+    across(where(is.character), ~ na_if(., "")),
+    across(where(is.character), ~ na_if(., "[Blank]"))
+  )
+
+# 2. Check ID fields before removing them from modelling data
+# IDs are kept until after the train/test split so duplicate records can be audited.
+id_duplicate_check <- data %>%
+  summarise(
+    total_rows = n(),
+    duplicate_recommendation_id = sum(duplicated(recommendation_id), na.rm = TRUE),
+    duplicate_request_id = sum(duplicated(request_id), na.rm = TRUE),
+    duplicate_life_id = sum(duplicated(life_id), na.rm = TRUE)
+  ) %>%
+  pivot_longer(
+    everything(),
+    names_to = "Check",
+    values_to = "Value"
+  )
+
+data_clean <- data
+
+# 3. Create target variable
+# Positive class is "Yes", meaning the underwriter is NEOS Life.
+data_clean <- data_clean %>%
+  mutate(
+    neos_flag = ifelse(underwriter == "NEOS Life", "Yes", "No"),
+    neos_flag = factor(neos_flag, levels = c("Yes", "No"))
+  )
+
+# 4. Convert product Yes/No variables to binary
+data_clean <- data_clean %>%
+  mutate(
+    life_bin = case_when(life == "Yes" ~ 1, life == "No" ~ 0, TRUE ~ NA_real_),
+    tpd_bin = case_when(tpd == "Yes" ~ 1, tpd == "No" ~ 0, TRUE ~ NA_real_),
+    trauma_bin = case_when(trauma == "Yes" ~ 1, trauma == "No" ~ 0, TRUE ~ NA_real_),
+    ip_bin = case_when(ip == "Yes" ~ 1, ip == "No" ~ 0, TRUE ~ NA_real_),
+    be_bin = case_when(be == "Yes" ~ 1, be == "No" ~ 0, TRUE ~ NA_real_),
+    severity_bin = case_when(severity == "Yes" ~ 1, severity == "No" ~ 0, TRUE ~ NA_real_)
+  )
+
+# 5. Keep records with at least one core product
+# The assignment focuses only on Life, TPD, Trauma and IP recommendations.
+data_clean <- data_clean %>%
+  mutate(
+    product_count = rowSums(
+      across(c(life_bin, tpd_bin, trauma_bin, ip_bin), ~ replace_na(.x, 0))
+    )
+  ) %>%
+  filter(product_count > 0)
+
+# 6. Clean numeric values
+data_clean <- data_clean %>%
+  mutate(
+    annual_income = ifelse(annual_income < 0, NA_real_, annual_income),
+    premium = ifelse(premium < 0, NA, premium),
+    annualised_premium = ifelse(annualised_premium < 0, NA, annualised_premium),
+    inside_super_premium = ifelse(inside_super_premium < 0, NA, inside_super_premium),
+    outside_super_premium = ifelse(outside_super_premium < 0, NA, outside_super_premium)
+  )
+
+# 7. Create engineered variables
+# Life, TPD and Trauma are lump-sum style covers.
+# IP is periodic cover, so it is kept separately.
+data_clean <- data_clean %>%
+  mutate(
+    has_alternative = ifelse(is.na(alternative), 0, 1),
+    life_cover_specific = ifelse(life_bin == 1, replace_na(life_cover_amount, 0), 0),
+    tpd_cover_specific = ifelse(tpd_bin == 1, replace_na(tpd_cover_amount, 0), 0),
+    trauma_cover_specific = ifelse(trauma_bin == 1, replace_na(trauma_cover_amount, 0), 0),
+    ip_cover_specific = ifelse(ip_bin == 1, replace_na(ip_cover_amount, 0), 0),
+    lump_sum_cover = rowSums(
+      across(
+        c(life_cover_amount, tpd_cover_amount, trauma_cover_amount),
+        ~ replace_na(.x, 0)
+      )
+    ),
+    ip_periodic_cover = replace_na(ip_cover_amount, 0),
+    log_annual_income = log1p(annual_income),
+    log_premium = log1p(premium),
+    log_annualised_premium = log1p(annualised_premium),
+    log_life_cover = log1p(life_cover_specific),
+    log_tpd_cover = log1p(tpd_cover_specific),
+    log_trauma_cover = log1p(trauma_cover_specific),
+    log_ip_cover = log1p(ip_cover_specific),
+    log_lump_sum_cover = log1p(lump_sum_cover),
+    log_ip_periodic_cover = log1p(ip_periodic_cover)
+  )
+
+# 8. Product bundle
+data_clean <- data_clean %>%
+  mutate(
+    product_bundle = case_when(
+      life_bin == 1 & tpd_bin == 0 & trauma_bin == 0 & ip_bin == 0 ~ "Life only",
+      life_bin == 0 & tpd_bin == 1 & trauma_bin == 0 & ip_bin == 0 ~ "TPD only",
+      life_bin == 0 & tpd_bin == 0 & trauma_bin == 1 & ip_bin == 0 ~ "Trauma only",
+      life_bin == 0 & tpd_bin == 0 & trauma_bin == 0 & ip_bin == 1 ~ "IP only",
+      life_bin == 1 & tpd_bin == 1 & trauma_bin == 0 & ip_bin == 0 ~ "Life + TPD",
+      life_bin == 1 & tpd_bin == 1 & trauma_bin == 1 & ip_bin == 0 ~ "Life + TPD + Trauma",
+      life_bin == 1 & tpd_bin == 1 & trauma_bin == 1 & ip_bin == 1 ~ "Life + TPD + Trauma + IP",
+      product_count >= 2 ~ "Other bundle",
+      TRUE ~ "Other"
+    )
+  )
+
+# 9. Commission structure organisation
+# Based on Australian life insurance 2020 legislation change.
+# Creates 3 new columns:
+# 1. commission_type
+# 2. initial_commission_rate_gst
+# 3. renewal_commission_rate_gst
+
+commission_text <- data_clean$commission_structure %>%
+  as.character() %>%
+  str_squish() %>%
+  str_to_lower() %>%
+  replace_na("unknown")
+
+# Extract C-rate, e.g. C100, C70, C85
+c_rate <- suppressWarnings(
+  as.numeric(str_match(commission_text, "c(\\d+(?:\\.\\d+)?)")[, 2])
+)
+
+# Extract direct pair, e.g. 66/22, 27.5/27.5, 40.7 / 16.5
+pair_rate <- str_match(
+  commission_text,
+  "(\\d+(?:\\.\\d+)?)\\s*%?\\s*/\\s*(\\d+(?:\\.\\d+)?)\\s*%?"
+)
+
+pair_initial <- suppressWarnings(as.numeric(pair_rate[, 2]))
+pair_renewal <- suppressWarnings(as.numeric(pair_rate[, 3]))
+
+# Extract modifier pair, e.g. 100% Init / 100% Renew
+init_modifier <- suppressWarnings(
+  as.numeric(
+    coalesce(
+      str_match(commission_text, "(\\d+(?:\\.\\d+)?)\\s*%?\\s*(init|initial|year1|yr1)")[, 2],
+      str_match(commission_text, "(init|initial|year1|yr1)\\s*(\\d+(?:\\.\\d+)?)\\s*%?")[, 3]
+    )
+  )
+)
+
+renew_modifier <- suppressWarnings(
+  as.numeric(
+    coalesce(
+      str_match(commission_text, "(\\d+(?:\\.\\d+)?)\\s*%?\\s*(renew|renewal|year2|yr2)")[, 2],
+      str_match(commission_text, "(renew|renewal|year2|yr2)\\s*(\\d+(?:\\.\\d+)?)\\s*%?")[, 3]
+    )
+  )
+)
+
+commission_type <- case_when(
+  commission_text == "unknown" ~ "Unknown",
+  str_detect(commission_text, "nil|nill|no commission|nil commission") ~ "No commission",
+  str_detect(commission_text, "level|l2evel|0% level") ~ "Level",
+  str_detect(commission_text, "upfront|higher initial|standard - upfront|initial \\(") ~ "Upfront / Higher initial",
+  str_detect(commission_text, "hybrid|h4ybrid|h3ybrid|h2ybrid|hybrid60|hybrid70|hybrid80") ~ "Hybrid",
+  TRUE ~ "Other specified"
+)
+
+# Base commission rates including GST
+# 2020 LIF cap: 60% initial + GST = 66%; 20% renewal + GST = 22%
+# Level commission is treated as 33% including GST.
+base_initial <- case_when(
+  commission_type == "Unknown" ~ NA_real_,
+  commission_type == "No commission" ~ 0,
+  commission_type == "Level" ~ 33,
+  str_detect(commission_text, "2018|hybrid80|88\\s*/\\s*22") ~ 88,
+  str_detect(commission_text, "2019|hybrid70|77\\s*/\\s*22") ~ 77,
+  commission_type %in% c("Hybrid", "Upfront / Higher initial") ~ 66,
+  TRUE ~ NA_real_
+)
+
+base_renewal <- case_when(
+  commission_type == "Unknown" ~ NA_real_,
+  commission_type == "No commission" ~ 0,
+  commission_type == "Level" ~ 33,
+  commission_type %in% c("Hybrid", "Upfront / Higher initial") ~ 22,
+  TRUE ~ NA_real_
+)
+
+# Decide whether pair values are actual rates or modifiers.
+# Example: 66/22 is actual.
+# Example: 100 Init / 100 Renew is a modifier of the base rate.
+has_modifier_words <- str_detect(
+  commission_text,
+  "init|initial|renew|renewal|year1|year2"
+)
+
+use_pair_as_modifier <- has_modifier_words &
+  !str_detect(commission_text, "yr1\\s*66|year1\\s*66|yr2\\s*22|year2\\s*22") &
+  !is.na(pair_initial) &
+  !is.na(pair_renewal) &
+  pair_initial <= 100 &
+  pair_renewal <= 100
+
+initial_rate <- case_when(
+  commission_type == "Unknown" ~ NA_real_,
+  commission_type == "No commission" ~ 0,
+  !is.na(c_rate) ~ base_initial * c_rate / 100,
+  !is.na(init_modifier) ~ base_initial * init_modifier / 100,
+  use_pair_as_modifier ~ base_initial * pair_initial / 100,
+  !is.na(pair_initial) ~ pair_initial,
+  commission_type %in% c("Hybrid", "Upfront / Higher initial", "Level") ~ base_initial,
+  TRUE ~ NA_real_
+)
+
+renewal_rate <- case_when(
+  commission_type == "Unknown" ~ NA_real_,
+  commission_type == "No commission" ~ 0,
+  !is.na(c_rate) ~ base_renewal * c_rate / 100,
+  !is.na(renew_modifier) ~ base_renewal * renew_modifier / 100,
+  use_pair_as_modifier ~ base_renewal * pair_renewal / 100,
+  !is.na(pair_renewal) ~ pair_renewal,
+  commission_type %in% c("Hybrid", "Upfront / Higher initial", "Level") ~ base_renewal,
+  TRUE ~ NA_real_
+)
+
+data_clean <- data_clean %>%
+  mutate(
+    commission_type = factor(commission_type),
+    initial_commission_rate_gst = case_when(
+      commission_text == "unknown" ~ "Unknown",
+      is.na(initial_rate) ~ "Not stated in label",
+      TRUE ~ paste0(round(initial_rate, 2), "%")
+    ),
+    renewal_commission_rate_gst = case_when(
+      commission_text == "unknown" ~ "Unknown",
+      is.na(renewal_rate) ~ "Not stated in label",
+      TRUE ~ paste0(round(renewal_rate, 2), "%")
+    ),
+    initial_commission_rate_gst = factor(initial_commission_rate_gst),
+    renewal_commission_rate_gst = factor(renewal_commission_rate_gst)
+  )
+
+# 10. Date variables
+fix_excel_date <- function(x) {
+  if (inherits(x, "Date")) return(x)
+  if (inherits(x, "POSIXct")) return(as.Date(x))
+  as.Date(as.numeric(x), origin = "1899-12-30")
+}
+
+data_clean <- data_clean %>%
+  mutate(
+    date = fix_excel_date(date),
+    year = year(date),
+    month = month(date, label = TRUE),
+    quarter = quarter(date),
+    weekday = wday(date, label = TRUE),
+    age_band = case_when(
+      age_next < 30 ~ "Under 30",
+      age_next < 40 ~ "30-39",
+      age_next < 50 ~ "40-49",
+      age_next < 60 ~ "50-59",
+      age_next >= 60 ~ "60+",
+      TRUE ~ NA_character_
+    )
+  )
+
+# 11. Collapse high-cardinality categorical variables
+data_clean <- data_clean %>%
+  mutate(
+    occupation_group = fct_lump_n(as.factor(occupation), n = 30, other_level = "Other"),
+    package_group = fct_lump_n(as.factor(package), n = 30, other_level = "Other"),
+    adviser_group = fct_lump_n(as.factor(adviser_id), n = 50, other_level = "Other"),
+    occupation_text = str_to_lower(as.character(occupation)),
+    occupation_category = case_when(
+      str_detect(occupation_text, "home duties|retired|student|unemployed") ~ "Home / retired / student",
+      str_detect(occupation_text, "doctor|medical|nurse|dentist|physio|psychologist|pharmacist|veterinary|surgeon|therapist|paramedic") ~ "Healthcare professional",
+      str_detect(occupation_text, "teacher|education|lecturer|academic|child care|teachers aide") ~ "Education / childcare",
+      str_detect(occupation_text, "lawyer|solicitor|legal|accountant|architect|engineer|computer|programmer|analyst|consultant|actuary|scientist") ~ "Professional / technical",
+      str_detect(occupation_text, "manager|management|chief executive|project manager|business development") ~ "Management",
+      str_detect(occupation_text, "clerical|administration|clerk|receptionist|bookkeeper|office|bank") ~ "Clerical / administration",
+      str_detect(occupation_text, "sales|real estate|retail|marketing") ~ "Sales / marketing",
+      str_detect(occupation_text, "electrician|plumber|carpenter|builder|mechanic|fitter|cabinet|chef|hairdresser|trade|construction|foreman") ~ "Trade / skilled manual",
+      str_detect(occupation_text, "driver|truck|mining|farming|police|fire|security|plant operator|manual|blue collar|heavy") ~ "Manual / field / higher risk",
+      str_detect(occupation_text, "1a|1b|white collar|1p|1l|1m") ~ "Professional / technical",
+      str_detect(occupation_text, "2a|2b|2c") ~ "White collar / clerical",
+      str_detect(occupation_text, "3a|3b|3m|\\b4\\b|\\b5\\b") ~ "Manual / field / higher risk",
+      TRUE ~ "Other"
+    ),
+    occupation_category = fct_lump_min(
+      as.factor(occupation_category),
+      min = 50,
+      other_level = "Other"
+    )
+  )
+
+# 12. Convert categorical fields to factors
+data_clean <- data_clean %>%
+  mutate(
+    across(
+      c(
+        neos_flag, underwriter, package, package_group,
+        super, rollover_tax_rebate, gender, smoker_status,
+        home_state, occupation, occupation_group, occupation_category, self_employed,
+        premium_frequency, product_bundle, commission_type,
+        initial_commission_rate_gst, renewal_commission_rate_gst,
+        age_band, month, weekday, adviser_group
+      ),
+      as.factor
+    )
+  )
+```
+
+# Missing Values
+
+```{r missing-values}
+id_duplicate_check %>%
+  kable(caption = "ID duplicate audit before ID removal")
+
+product_scope_summary <- data_clean %>%
+  summarise(
+    Life = sum(life_bin == 1, na.rm = TRUE),
+    TPD = sum(tpd_bin == 1, na.rm = TRUE),
+    Trauma = sum(trauma_bin == 1, na.rm = TRUE),
+    IP = sum(ip_bin == 1, na.rm = TRUE),
+    Multi_Product = sum(product_count >= 2, na.rm = TRUE)
+  ) %>%
+  pivot_longer(
+    everything(),
+    names_to = "Product_Group",
+    values_to = "Recommendation_Count"
+  ) %>%
+  mutate(
+    Percent = round(Recommendation_Count / nrow(data_clean) * 100, 2)
+  )
+
+product_scope_summary %>%
+  kable(caption = "Life, TPD, Trauma and IP product scope")
+
+missing_table <- data_clean %>%
+  summarise(across(everything(), ~ sum(is.na(.)))) %>%
+  pivot_longer(
+    cols = everything(),
+    names_to = "Variable",
+    values_to = "Missing_Count"
+  ) %>%
+  mutate(
+    Missing_Percent = round(Missing_Count / nrow(data_clean) * 100, 4)
+  ) %>%
+  arrange(desc(Missing_Count), Variable)
+
+kable(missing_table)
+```
+
+# Final Modelling Data
+
+```{r model-data}
+id_columns <- c(
+  "row_id",
+  "recommendation_id",
+  "request_id",
+  "life_id",
+  "external_ref"
+)
+
+# Shared modelling population for all supervised models.
+# IDs stay here until after train/test splitting, then they are removed.
+model_data_with_ids <- data_clean %>%
+  mutate(
+    row_id = row_number(),
+    has_alternative = factor(has_alternative, levels = c(0, 1))
+  ) %>%
+  dplyr::select(
+    row_id,
+    recommendation_id,
+    request_id,
+    life_id,
+    external_ref,
+    neos_flag,
+
+    # Customer characteristics
+    age_next,
+    gender,
+    smoker_status,
+    home_state,
+    occupation_group,
+    occupation_category,
+    self_employed,
+    log_annual_income,
+
+    # Product characteristics
+    super,
+    rollover_tax_rebate,
+    life_bin,
+    tpd_bin,
+    trauma_bin,
+    ip_bin,
+    product_count,
+    product_bundle,
+    log_annualised_premium,
+    log_lump_sum_cover,
+    log_ip_periodic_cover,
+    premium_frequency,
+
+    # Adviser and recommendation characteristics.
+    # Commission is excluded from final predictors after split due to leakage risk.
+    has_alternative
+  ) %>%
+  filter(if_all(-all_of(id_columns), ~ !is.na(.x)))
+
+naive_data_final <- model_data_with_ids %>%
+  dplyr::select(
+    all_of(id_columns),
+    neos_flag,
+    age_next, gender, smoker_status, home_state,
+    occupation_group, self_employed, log_annual_income,
+    super, rollover_tax_rebate,
+    life_bin, tpd_bin, trauma_bin, ip_bin, product_count, product_bundle,
+    log_annualised_premium, log_lump_sum_cover,
+    log_ip_periodic_cover,
+    premium_frequency,
+    has_alternative
+  ) %>%
+  mutate(neos_flag = factor(neos_flag, levels = c("Yes", "No")))
+
+knn_data_final <- model_data_with_ids %>%
+  dplyr::select(
+    all_of(id_columns),
+    neos_flag,
+    age_next, gender, smoker_status, home_state,
+    occupation_category, self_employed, log_annual_income,
+    super, rollover_tax_rebate,
+    life_bin, tpd_bin, trauma_bin, ip_bin, product_count,
+    log_annualised_premium, log_lump_sum_cover,
+    log_ip_periodic_cover,
+    premium_frequency,
+    has_alternative
+  ) %>%
+  mutate(neos_flag = factor(neos_flag, levels = c("Yes", "No")))
+
+tree_data_final <- model_data_with_ids %>%
+  dplyr::select(
+    all_of(id_columns),
+    neos_flag,
+    age_next, gender, smoker_status, home_state,
+    occupation_group, self_employed, log_annual_income,
+    super, rollover_tax_rebate,
+    life_bin, tpd_bin, trauma_bin, ip_bin, product_count, product_bundle,
+    log_annualised_premium, log_lump_sum_cover,
+    log_ip_periodic_cover,
+    premium_frequency,
+    has_alternative
+  ) %>%
+  mutate(neos_flag = factor(neos_flag, levels = c("Yes", "No")))
+
+common_model_ids <- Reduce(
+  intersect,
+  list(
+    naive_data_final$row_id,
+    knn_data_final$row_id,
+    tree_data_final$row_id
+  )
+)
+
+model_data <- tree_data_final %>%
+  filter(row_id %in% common_model_ids) %>%
+  arrange(row_id)
+
+naive_data_final <- naive_data_final %>%
+  filter(row_id %in% common_model_ids) %>%
+  arrange(row_id)
+
+knn_data_final <- knn_data_final %>%
+  filter(row_id %in% common_model_ids) %>%
+  arrange(row_id)
+
+tree_data_final <- tree_data_final %>%
+  filter(row_id %in% common_model_ids) %>%
+  arrange(row_id)
+
+product_model_data <- list(
+  Life = model_data %>% filter(life_bin == 1),
+  TPD = model_data %>% filter(tpd_bin == 1),
+  Trauma = model_data %>% filter(trauma_bin == 1),
+  IP = model_data %>% filter(ip_bin == 1)
+)
+
+product_model_summary <- imap_dfr(
+  product_model_data,
+  ~ tibble(
+    Product = .y,
+    Records = nrow(.x),
+    NEOS_Yes_Rate = mean(.x$neos_flag == "Yes")
+  )
+)
+
+# Check the number of observations and class balance.
+model_population_summary <- bind_rows(
+  naive_data_final %>% count(neos_flag) %>% mutate(Model_Data = "Naive / Complement Naive"),
+  knn_data_final %>% count(neos_flag) %>% mutate(Model_Data = "KNN"),
+  tree_data_final %>% count(neos_flag) %>% mutate(Model_Data = "Logistic / Tree / Ensemble")
+) %>%
+  group_by(Model_Data) %>%
+  mutate(percent = n / sum(n))
+
+kable(model_population_summary, caption = "Final modelling data class balance")
+
+kable(product_model_summary, caption = "Product-specific modelling subsets")
+```
+
+# Helper Functions
+
+```{r modelling-helpers}
+# Convert predicted probabilities into Yes/No classifications.
+probability_to_class <- function(
+    probability,
+    threshold = CLASSIFICATION_THRESHOLD
+) {
+  factor(
+    if_else(probability >= threshold, "Yes", "No"),
+    levels = c("Yes", "No")
+  )
+}
+
+# Evaluate model performance.
+make_confusion_matrix <- function(
+    predicted,
+    actual
+) {
+  predicted <- factor(
+    as.character(predicted),
+    levels = c("Yes", "No")
+  )
+
+  actual <- factor(
+    as.character(actual),
+    levels = c("Yes", "No")
+  )
+
+  confusionMatrix(
+    data = predicted,
+    reference = actual,
+    positive = "Yes"
+  )
+}
+
+evaluate_model <- function(
+    model_name,
+    actual,
+    predicted,
+    probability
+) {
+
+  actual <- factor(as.character(actual), levels = c("Yes", "No"))
+  predicted <- factor(as.character(predicted), levels = c("Yes", "No"))
+
+  confusion <- make_confusion_matrix(
+    predicted = predicted,
+    actual = actual
+  )
+
+  roc_result <- roc(
+    response = actual,
+    predictor = probability,
+    levels = c("No", "Yes"),
+    direction = "<",
+    quiet = TRUE
+  )
+
+  tibble(
+    Model = model_name,
+    Accuracy = as.numeric(
+      confusion$overall["Accuracy"]
+    ),
+    Sensitivity = as.numeric(
+      confusion$byClass["Sensitivity"]
+    ),
+    Specificity = as.numeric(
+      confusion$byClass["Specificity"]
+    ),
+    Precision = as.numeric(
+      confusion$byClass["Pos Pred Value"]
+    ),
+    F1_Score = as.numeric(
+      confusion$byClass["F1"]
+    ),
+    Balanced_Accuracy = as.numeric(
+      confusion$byClass["Balanced Accuracy"]
+    ),
+    AUC = as.numeric(
+      auc(roc_result)
+    )
+  )
+}
+
+make_split_ids <- function(data, p = TRAIN_PROPORTION) {
+  train_index <- createDataPartition(data$neos_flag, p = p, list = FALSE)
+  list(
+    train_ids = data$row_id[train_index],
+    test_ids = data$row_id[-train_index]
+  )
+}
+
+sample_stratified <- function(data, cap) {
+  if (is.infinite(cap) || nrow(data) <= cap) return(data)
+  sample_index <- createDataPartition(
+    data$neos_flag,
+    p = cap / nrow(data),
+    list = FALSE
+  )
+  data[sample_index, ]
+}
+
+performance_metrics <- function(model_name, actual, predicted_class, predicted_prob) {
+  cm <- confusionMatrix(predicted_class, actual, positive = "Yes")
+  auc_value <- auc(
+    response = actual,
+    predictor = predicted_prob,
+    levels = c("No", "Yes"),
+    quiet = TRUE
+  )
+
+  tibble(
+    Model = model_name,
+    AUC = as.numeric(auc_value),
+    Accuracy = unname(cm$overall["Accuracy"]),
+    Kappa = unname(cm$overall["Kappa"]),
+    Sensitivity_Recall = unname(cm$byClass["Sensitivity"]),
+    Specificity = unname(cm$byClass["Specificity"]),
+    Precision = unname(cm$byClass["Precision"]),
+    F1 = unname(cm$byClass["F1"]),
+    Balanced_Accuracy = unname(cm$byClass["Balanced Accuracy"])
+  )
+}
+
+confusion_table <- function(model_name, actual, predicted_class) {
+  cm <- confusionMatrix(predicted_class, actual, positive = "Yes")
+
+  as.data.frame.matrix(cm$table) %>%
+    rownames_to_column("Predicted") %>%
+    mutate(Model = model_name, .before = 1)
+}
+
+lift_table <- function(model_name, actual, predicted_prob) {
+  base_rate <- mean(actual == "Yes")
+
+  tibble(
+    Actual = actual,
+    Probability_Yes = predicted_prob
+  ) %>%
+    arrange(desc(Probability_Yes)) %>%
+    mutate(
+      Decile = ntile(-Probability_Yes, 10),
+      Is_Yes = as.integer(Actual == "Yes")
+    ) %>%
+    group_by(Decile) %>%
+    summarise(
+      Model = model_name,
+      Records = n(),
+      Actual_Yes = sum(Is_Yes),
+      Mean_Probability_Yes = mean(Probability_Yes),
+      Response_Rate = mean(Is_Yes),
+      Decile_Lift = Response_Rate / base_rate,
+      .groups = "drop"
+    ) %>%
+    arrange(Decile) %>%
+    mutate(
+      Cumulative_Records = cumsum(Records),
+      Cumulative_Yes = cumsum(Actual_Yes),
+      Cumulative_Response_Rate = Cumulative_Yes / Cumulative_Records,
+      Cumulative_Lift = Cumulative_Response_Rate / base_rate
+    )
+}
+
+best_roc_threshold <- function(actual, predicted_prob) {
+  roc_object <- roc(
+    response = actual,
+    predictor = predicted_prob,
+    levels = c("No", "Yes"),
+    quiet = TRUE
+  )
+
+  as.numeric(coords(
+    roc_object,
+    x = "best",
+    best.method = "youden",
+    ret = "threshold"
+  ))
+}
+
+fit_complement_nb <- function(train_data, target = "neos_flag", alpha = 1) {
+  y <- train_data[[target]]
+  x_raw <- train_data %>% dplyr::select(-all_of(target))
+
+  numeric_cols <- names(x_raw)[map_lgl(x_raw, is.numeric)]
+  numeric_stats <- map(
+    numeric_cols,
+    ~ list(
+      min = min(x_raw[[.x]], na.rm = TRUE),
+      max = max(x_raw[[.x]], na.rm = TRUE)
+    )
+  )
+  names(numeric_stats) <- numeric_cols
+
+  x_scaled <- x_raw
+  for (col_name in numeric_cols) {
+    col_min <- numeric_stats[[col_name]]$min
+    col_max <- numeric_stats[[col_name]]$max
+    if (is.finite(col_min) && is.finite(col_max) && col_max > col_min) {
+      x_scaled[[col_name]] <- (x_scaled[[col_name]] - col_min) / (col_max - col_min)
+    } else {
+      x_scaled[[col_name]] <- 0
+    }
+  }
+
+  dummy_model <- dummyVars(~ ., data = x_scaled, fullRank = FALSE)
+  x_matrix <- as.matrix(predict(dummy_model, newdata = x_scaled))
+  x_matrix[is.na(x_matrix)] <- 0
+  x_matrix[x_matrix < 0] <- 0
+
+  class_levels <- levels(y)
+  class_prior <- table(y)[class_levels] / length(y)
+
+  log_theta <- map_dfr(class_levels, function(class_name) {
+    complement_x <- x_matrix[y != class_name, , drop = FALSE]
+    feature_count <- colSums(complement_x) + alpha
+    feature_prob <- feature_count / sum(feature_count)
+    tibble(Class = class_name, Feature = names(feature_prob), Log_Theta = log(feature_prob))
+  })
+
+  list(
+    dummy_model = dummy_model,
+    numeric_stats = numeric_stats,
+    feature_names = colnames(x_matrix),
+    log_theta = log_theta,
+    class_levels = class_levels,
+    class_prior = class_prior,
+    target = target
+  )
+}
+
+predict_complement_nb <- function(model, newdata) {
+  x_raw <- newdata %>% dplyr::select(-all_of(model$target))
+  x_scaled <- x_raw
+
+  for (col_name in names(model$numeric_stats)) {
+    col_min <- model$numeric_stats[[col_name]]$min
+    col_max <- model$numeric_stats[[col_name]]$max
+    if (is.finite(col_min) && is.finite(col_max) && col_max > col_min) {
+      x_scaled[[col_name]] <- (x_scaled[[col_name]] - col_min) / (col_max - col_min)
+      x_scaled[[col_name]] <- pmin(pmax(x_scaled[[col_name]], 0), 1)
+    } else {
+      x_scaled[[col_name]] <- 0
+    }
+  }
+
+  x_matrix <- as.matrix(predict(model$dummy_model, newdata = x_scaled))
+  x_matrix[is.na(x_matrix)] <- 0
+  x_matrix[x_matrix < 0] <- 0
+
+  missing_features <- setdiff(model$feature_names, colnames(x_matrix))
+  if (length(missing_features) > 0) {
+    x_matrix <- cbind(
+      x_matrix,
+      matrix(0, nrow = nrow(x_matrix), ncol = length(missing_features),
+             dimnames = list(NULL, missing_features))
+    )
+  }
+  x_matrix <- x_matrix[, model$feature_names, drop = FALSE]
+
+  log_theta_matrix <- model$log_theta %>%
+    pivot_wider(names_from = Feature, values_from = Log_Theta) %>%
+    arrange(match(Class, model$class_levels))
+
+  theta_matrix <- as.matrix(log_theta_matrix %>% dplyr::select(-Class))
+  theta_matrix <- theta_matrix[, model$feature_names, drop = FALSE]
+
+  scores <- -x_matrix %*% t(theta_matrix)
+  scores <- sweep(scores, 2, log(as.numeric(model$class_prior[model$class_levels])), "+")
+  colnames(scores) <- model$class_levels
+
+  scores <- sweep(scores, 1, apply(scores, 1, max), "-")
+  prob <- exp(scores)
+  prob <- prob / rowSums(prob)
+  as.data.frame(prob)
+}
+
+knn_summary <- function(data, lev = NULL, model = NULL) {
+  roc_stats <- twoClassSummary(data, lev = lev, model = model)
+  accuracy <- mean(data$pred == data$obs)
+  c(roc_stats, Accuracy = accuracy)
+}
+```
+
+# Train-Test Split
+
+```{r split-data}
+# One shared split for all models.
+# IDs are used only to align rows, then removed from model predictors.
+set.seed(SEED)
+
+train_index <- createDataPartition(
+  y = model_data$neos_flag,
+  p = TRAIN_PROPORTION,
+  list = FALSE
+)
+
+shared_train_ids <- model_data$row_id[train_index]
+shared_test_ids <- model_data$row_id[-train_index]
+
+naive_train <- naive_data_final %>%
+  filter(row_id %in% shared_train_ids) %>%
+  dplyr::select(-all_of(id_columns))
+
+naive_test <- naive_data_final %>%
+  filter(row_id %in% shared_test_ids) %>%
+  dplyr::select(-all_of(id_columns))
+
+knn_train_base <- knn_data_final %>%
+  filter(row_id %in% shared_train_ids)
+
+knn_test_base <- knn_data_final %>%
+  filter(row_id %in% shared_test_ids)
+
+train_data <- tree_data_final %>%
+  filter(row_id %in% shared_train_ids) %>%
+  dplyr::select(-all_of(id_columns))
+
+test_data <- tree_data_final %>%
+  filter(row_id %in% shared_test_ids) %>%
+  dplyr::select(-all_of(id_columns))
+
+split_summary <- tibble(
+  Dataset = c("Training", "Testing"),
+  Rows = c(nrow(train_data), nrow(test_data)),
+  NEOS_Yes_Rate = c(
+    mean(train_data$neos_flag == "Yes"),
+    mean(test_data$neos_flag == "Yes")
+  )
+)
+
+kable(split_summary, caption = "Shared train-test split summary")
+```
+
+# Naive Bayes
+
+```{r naive-bayes-model, message=FALSE, warning=FALSE}
+naive_model <- naiveBayes(
+  neos_flag ~ .,
+  data = naive_train,
+  laplace = 1
+)
+
+naive_train_probability <- predict(
+  naive_model,
+  newdata = naive_train,
+  type = "raw"
+)[, "Yes"]
+
+naive_threshold <- best_roc_threshold(naive_train$neos_flag, naive_train_probability)
+
+naive_probability <- predict(
+  naive_model,
+  newdata = naive_test,
+  type = "raw"
+)[, "Yes"]
+
+naive_prediction <- probability_to_class(
+  naive_probability,
+  naive_threshold
+)
+```
+
+# Complement Naive Bayes
+
+```{r complement-naive-bayes-model, message=FALSE, warning=FALSE}
+complement_naive_model <- fit_complement_nb(
+  train_data = naive_train,
+  target = "neos_flag",
+  alpha = 1
+)
+
+complement_naive_train_probability <- predict_complement_nb(
+  complement_naive_model,
+  naive_train
+)[, "Yes"]
+
+complement_naive_threshold <- best_roc_threshold(
+  naive_train$neos_flag,
+  complement_naive_train_probability
+)
+
+complement_naive_probability <- predict_complement_nb(
+  complement_naive_model,
+  naive_test
+)[, "Yes"]
+
+complement_naive_prediction <- probability_to_class(
+  complement_naive_probability,
+  complement_naive_threshold
+)
+```
+
+# KNN
+
+```{r knn-model, message=FALSE, warning=FALSE}
+knn_train_cap <- 1000
+knn_test_cap <- Inf
+
+knn_train_sample <- knn_train_base %>%
+  sample_stratified(knn_train_cap)
+
+knn_test_sample <- knn_test_base %>%
+  sample_stratified(knn_test_cap)
+
+knn_train_ids <- knn_train_sample$row_id
+knn_test_ids <- knn_test_sample$row_id
+
+knn_train <- knn_train_sample %>%
+  dplyr::select(-all_of(id_columns))
+
+knn_test <- knn_test_sample %>%
+  dplyr::select(-all_of(id_columns))
+
+knn_dummy_model <- dummyVars(
+  ~ .,
+  data = knn_train %>% dplyr::select(-neos_flag),
+  fullRank = TRUE
+)
+
+knn_x_train <- as.data.frame(
+  predict(knn_dummy_model, newdata = knn_train %>% dplyr::select(-neos_flag))
+)
+
+knn_x_test <- as.data.frame(
+  predict(knn_dummy_model, newdata = knn_test %>% dplyr::select(-neos_flag))
+)
+
+knn_nzv_cols <- nearZeroVar(knn_x_train)
+if (length(knn_nzv_cols) > 0) {
+  knn_x_train <- knn_x_train[, -knn_nzv_cols, drop = FALSE]
+  knn_x_test <- knn_x_test[, names(knn_x_train), drop = FALSE]
+}
+
+knn_cor_matrix <- cor(knn_x_train)
+knn_high_corr <- findCorrelation(knn_cor_matrix, cutoff = 0.90, names = TRUE)
+
+if (length(knn_high_corr) > 0) {
+  knn_x_train <- knn_x_train[, !names(knn_x_train) %in% knn_high_corr, drop = FALSE]
+  knn_x_test <- knn_x_test[, names(knn_x_train), drop = FALSE]
+}
+
+knn_scale_model <- preProcess(knn_x_train, method = c("center", "scale"))
+knn_x_train <- predict(knn_scale_model, knn_x_train)
+knn_x_test <- predict(knn_scale_model, knn_x_test)
+
+knn_train_processed <- cbind(neos_flag = knn_train$neos_flag, knn_x_train)
+knn_test_processed <- cbind(neos_flag = knn_test$neos_flag, knn_x_test)
+
+knn_control_base <- trainControl(
+  method = "cv",
+  number = 5,
+  classProbs = TRUE,
+  summaryFunction = knn_summary
+)
+
+knn_control_down <- trainControl(
+  method = "cv",
+  number = 5,
+  classProbs = TRUE,
+  summaryFunction = knn_summary,
+  sampling = "down"
+)
+
+knn_grid <- expand.grid(
+  kmax = c(5, 11, 21, 31, 51),
+  distance = 2,
+  kernel = c("rectangular", "triangular")
+)
+
+knn_model_base <- train(
+  neos_flag ~ .,
+  data = knn_train_processed,
+  method = "kknn",
+  metric = "ROC",
+  trControl = knn_control_base,
+  tuneGrid = knn_grid
+)
+
+knn_model_down <- train(
+  neos_flag ~ .,
+  data = knn_train_processed,
+  method = "kknn",
+  metric = "ROC",
+  trControl = knn_control_down,
+  tuneGrid = knn_grid
+)
+
+knn_base_train_probability <- predict(
+  knn_model_base,
+  newdata = knn_train_processed,
+  type = "prob"
+)[, "Yes"]
+
+knn_down_train_probability <- predict(
+  knn_model_down,
+  newdata = knn_train_processed,
+  type = "prob"
+)[, "Yes"]
+
+knn_base_threshold <- best_roc_threshold(knn_train$neos_flag, knn_base_train_probability)
+knn_down_threshold <- best_roc_threshold(knn_train$neos_flag, knn_down_train_probability)
+
+knn_base_probability <- predict(
+  knn_model_base,
+  newdata = knn_test_processed,
+  type = "prob"
+)[, "Yes"]
+
+knn_down_probability <- predict(
+  knn_model_down,
+  newdata = knn_test_processed,
+  type = "prob"
+)[, "Yes"]
+
+knn_base_prediction <- probability_to_class(
+  knn_base_probability,
+  knn_base_threshold
+)
+
+knn_down_prediction <- probability_to_class(
+  knn_down_probability,
+  knn_down_threshold
+)
+
+knn_model_base$bestTune
+knn_model_down$bestTune
+```
+
+# Logistic Regression
+
+```{r logistic-regression-model, message=FALSE, warning=FALSE}
+# A separate numeric response ensures that the model predicts
+# the probability of "Yes" rather than the probability of "No".
+logistic_train_data <- train_data %>%
+  mutate(
+    neos_numeric = if_else(neos_flag == "Yes", 1, 0)
+  ) %>%
+  dplyr::select(-neos_flag)
+
+logistic_test_x <- test_data %>%
+  dplyr::select(-neos_flag)
+
+logistic_regression_model <- glm(
+  neos_numeric ~ .,
+  data = logistic_train_data,
+  family = binomial(link = "logit")
+)
+
+logistic_regression_probability <- predict(
+  logistic_regression_model,
+  newdata = logistic_test_x,
+  type = "response"
+)
+
+logistic_regression_prediction <- probability_to_class(
+  logistic_regression_probability
+)
+```
+
+# Decision Tree
+
+```{r decision-tree-model, message=FALSE, warning=FALSE}
+set.seed(SEED)
+
+tree_tune_control <- trainControl(
+  method = "cv",
+  number = 3,
+  classProbs = TRUE,
+  summaryFunction = twoClassSummary,
+  savePredictions = "final"
+)
+
+decision_tree_model <- train(
+  neos_flag ~ .,
+  data = train_data,
+  method = "rpart",
+  metric = "ROC",
+  trControl = tree_tune_control,
+  tuneGrid = expand.grid(
+    cp = c(0.001, 0.005, 0.01, 0.02)
+  ),
+  parms = list(
+    prior = c(Yes = 0.50, No = 0.50),
+    split = "gini"
+  ),
+  control = rpart.control(minsplit = 20, minbucket = 7, maxdepth = 10)
+)
+
+decision_tree_probability <- predict(
+  decision_tree_model,
+  newdata = test_data,
+  type = "prob"
+)[, "Yes"]
+
+decision_tree_prediction <- probability_to_class(
+  decision_tree_probability
+)
+```
+
+# Random Forest
+
+```{r random-forest-model, message=FALSE, warning=FALSE}
+set.seed(SEED)
+
+rf_mtry_grid <- expand.grid(
+  mtry = unique(pmax(
+    1,
+    round(c(
+      sqrt(ncol(train_data) - 1),
+      (ncol(train_data) - 1) / 4
+    ))
+  ))
+)
+
+random_forest_model <- train(
+  neos_flag ~ .,
+  data = train_data,
+  method = "rf",
+  metric = "ROC",
+  trControl = tree_tune_control,
+  tuneGrid = rf_mtry_grid,
+  ntree = 75,
+  importance = TRUE
+)
+
+random_forest_probability <- predict(
+  random_forest_model,
+  newdata = test_data,
+  type = "prob"
+)[, "Yes"]
+
+random_forest_prediction <- probability_to_class(
+  random_forest_probability
+)
+```
+
+# XGBoost Data Preparation
+
+```{r xgboost-data-preparation, message=FALSE, warning=FALSE}
+# Commission variables are excluded from XGBoost so this model focuses on
+# customer, product and recommendation profile signals only.
+xgb_train_data <- train_data %>%
+  dplyr::select(
+    -matches("commission|initial_rate|renewal_rate")
+  )
+
+xgb_test_data <- test_data %>%
+  dplyr::select(
+    -matches("commission|initial_rate|renewal_rate")
+  )
+
+# XGBoost requires numeric predictors, so categorical variables
+# are converted into dummy variables.
+xgb_dummy_model <- dummyVars(
+  neos_flag ~ .,
+  data = xgb_train_data,
+  fullRank = FALSE
+)
+
+xgb_train_x <- predict(
+  xgb_dummy_model,
+  newdata = xgb_train_data
+) %>%
+  as.matrix()
+
+xgb_test_x <- predict(
+  xgb_dummy_model,
+  newdata = xgb_test_data
+) %>%
+  as.matrix()
+
+xgb_train_y <- if_else(
+  xgb_train_data$neos_flag == "Yes",
+  1,
+  0
+)
+```
+
+# XGBoost
+
+```{r xgboost-model, message=FALSE, warning=FALSE}
+xgb_tune_grid <- expand.grid(
+  nrounds = c(50, 100),
+  max_depth = 3,
+  eta = 0.10,
+  gamma = 0,
+  colsample_bytree = 0.80,
+  min_child_weight = 1,
+  subsample = 0.80
+)
+
+xgb_train_matrix <- xgb.DMatrix(
+  data = xgb_train_x,
+  label = xgb_train_y
+)
+
+xgb_test_matrix <- xgb.DMatrix(
+  data = xgb_test_x
+)
+
+xgb_cv_results <- pmap_dfr(
+  xgb_tune_grid,
+  function(
+    nrounds,
+    max_depth,
+    eta,
+    gamma,
+    colsample_bytree,
+    min_child_weight,
+    subsample
+  ) {
+    set.seed(SEED)
+
+    cv_model <- xgb.cv(
+      data = xgb_train_matrix,
+      objective = "binary:logistic",
+      eval_metric = "auc",
+      nrounds = nrounds,
+      nfold = 3,
+      max_depth = max_depth,
+      eta = eta,
+      gamma = gamma,
+      colsample_bytree = colsample_bytree,
+      min_child_weight = min_child_weight,
+      subsample = subsample,
+      stratified = TRUE,
+      verbose = 0,
+      early_stopping_rounds = 10
+    )
+
+    cv_log <- cv_model$evaluation_log
+    auc_column <- names(cv_log)[str_detect(names(cv_log), "test_auc_mean")]
+
+    best_iteration <- if (!is.null(cv_model$best_iteration)) {
+      cv_model$best_iteration
+    } else {
+      cv_log$iter[which.max(cv_log[[auc_column]])]
+    }
+
+    tibble(
+      nrounds = nrounds,
+      max_depth = max_depth,
+      eta = eta,
+      gamma = gamma,
+      colsample_bytree = colsample_bytree,
+      min_child_weight = min_child_weight,
+      subsample = subsample,
+      best_iteration = best_iteration,
+      CV_AUC = max(cv_log[[auc_column]], na.rm = TRUE)
+    )
+  }
+) %>%
+  arrange(desc(CV_AUC))
+
+xgb_best_params <- xgb_cv_results %>%
+  slice_head(n = 1)
+
+xgb_best_nrounds <- xgb_best_params$best_iteration
+
+if (length(xgb_best_nrounds) == 0 || is.na(xgb_best_nrounds) || xgb_best_nrounds < 1) {
+  xgb_best_nrounds <- xgb_best_params$nrounds
+}
+
+xgboost_model <- xgb.train(
+  data = xgb_train_matrix,
+  objective = "binary:logistic",
+  eval_metric = "auc",
+  nrounds = xgb_best_nrounds,
+  max_depth = xgb_best_params$max_depth,
+  eta = xgb_best_params$eta,
+  gamma = xgb_best_params$gamma,
+  colsample_bytree = xgb_best_params$colsample_bytree,
+  min_child_weight = xgb_best_params$min_child_weight,
+  subsample = xgb_best_params$subsample,
+  verbose = 0
+)
+
+xgboost_probability <- predict(
+  xgboost_model,
+  newdata = xgb_test_matrix
+)
+
+xgboost_prediction <- probability_to_class(
+  xgboost_probability
+)
+
+kable(xgb_cv_results, digits = 4, caption = "XGBoost cross-validated AUC tuning results")
+```
+
+# Model Comparison
+
+```{r model-comparison}
+evaluation_actual <- factor(
+  as.character(test_data$neos_flag),
+  levels = c("Yes", "No")
+)
+
+evaluation_dataset_check <- tibble(
+  Evaluation_Set = c(
+    "Shared test set",
+    "Naive / Complement Naive test set",
+    "KNN test set",
+    "Logistic / Tree / Ensemble test set"
+  ),
+  Rows = c(
+    length(evaluation_actual),
+    nrow(naive_test),
+    nrow(knn_test),
+    nrow(test_data)
+  ),
+  NEOS_Yes_Rate = c(
+    mean(evaluation_actual == "Yes"),
+    mean(naive_test$neos_flag == "Yes"),
+    mean(knn_test$neos_flag == "Yes"),
+    mean(test_data$neos_flag == "Yes")
+  )
+)
+
+kable(
+  evaluation_dataset_check,
+  digits = 4,
+  caption = "Evaluation dataset consistency check"
+)
+
+model_comparison <- bind_rows(
+  evaluate_model(
+    model_name = "Naive Bayes",
+    actual = evaluation_actual,
+    predicted = naive_prediction,
+    probability = naive_probability
+  ),
+
+  evaluate_model(
+    model_name = "Complement Naive Bayes",
+    actual = evaluation_actual,
+    predicted = complement_naive_prediction,
+    probability = complement_naive_probability
+  ),
+
+  evaluate_model(
+    model_name = "KNN baseline",
+    actual = evaluation_actual,
+    predicted = knn_base_prediction,
+    probability = knn_base_probability
+  ),
+
+  evaluate_model(
+    model_name = "KNN downsampled",
+    actual = evaluation_actual,
+    predicted = knn_down_prediction,
+    probability = knn_down_probability
+  ),
+
+  evaluate_model(
+    model_name = "Logistic Regression",
+    actual = evaluation_actual,
+    predicted = logistic_regression_prediction,
+    probability = logistic_regression_probability
+  ),
+
+  evaluate_model(
+    model_name = "Decision Tree",
+    actual = evaluation_actual,
+    predicted = decision_tree_prediction,
+    probability = decision_tree_probability
+  ),
+
+  evaluate_model(
+    model_name = "Random Forest",
+    actual = evaluation_actual,
+    predicted = random_forest_prediction,
+    probability = random_forest_probability
+  ),
+
+  evaluate_model(
+    model_name = "XGBoost",
+    actual = evaluation_actual,
+    predicted = xgboost_prediction,
+    probability = xgboost_probability
+  )
+) %>%
+  mutate(
+    across(
+      where(is.numeric),
+      ~ round(.x, 4)
+    )
+  ) %>%
+  arrange(desc(AUC))
+
+kable(model_comparison, caption = "Model comparison")
+```
+
+# AUC Comparison For Model Selection
+
+```{r auc-comparison-chart, fig.height=5, fig.width=9}
+auc_comparison_plot_data <- model_comparison %>%
+  mutate(
+    Model = fct_reorder(Model, AUC),
+    Selection_Group = if_else(
+      Model %in% c(
+        "Complement Naive Bayes",
+        "Logistic Regression",
+        "Random Forest"
+      ),
+      "Selected / interpreted model",
+      "Comparison model"
+    )
+  )
+
+ggplot(
+  auc_comparison_plot_data,
+  aes(
+    x = Model,
+    y = AUC,
+    fill = Selection_Group
+  )
+) +
+  geom_col(
+    width = 0.72,
+    alpha = 0.92
+  ) +
+  geom_text(
+    aes(label = round(AUC, 3)),
+    hjust = -0.15,
+    size = 3.5,
+    fontface = "bold"
+  ) +
+  coord_flip() +
+  scale_fill_manual(
+    values = c(
+      "Selected / interpreted model" = "#5D3FD3",
+      "Comparison model" = "#B57EDC"
+    )
+  ) +
+  scale_y_continuous(
+    limits = c(0, 1.05),
+    breaks = seq(0, 1, 0.1)
+  ) +
+  labs(
+    title = "AUC Comparison Across Candidate Models",
+    subtitle = "Higher AUC indicates stronger ability to separate NEOS from non-NEOS recommendations",
+    x = NULL,
+    y = "AUC",
+    fill = "Model group"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(face = "bold", size = 15),
+    plot.subtitle = element_text(colour = "grey30"),
+    legend.position = "top",
+    panel.grid.minor = element_blank()
+  )
+```
+
+# Confusion Matrices
+
+```{r confusion-matrices}
+naive_confusion_matrix <- make_confusion_matrix(
+  predicted = naive_prediction,
+  actual = evaluation_actual
+)
+
+complement_naive_confusion_matrix <- make_confusion_matrix(
+  predicted = complement_naive_prediction,
+  actual = evaluation_actual
+)
+
+knn_base_confusion_matrix <- make_confusion_matrix(
+  predicted = knn_base_prediction,
+  actual = evaluation_actual
+)
+
+knn_down_confusion_matrix <- make_confusion_matrix(
+  predicted = knn_down_prediction,
+  actual = evaluation_actual
+)
+
+logistic_confusion_matrix <- make_confusion_matrix(
+  predicted = logistic_regression_prediction,
+  actual = evaluation_actual
+)
+
+decision_tree_confusion_matrix <- make_confusion_matrix(
+  predicted = decision_tree_prediction,
+  actual = evaluation_actual
+)
+
+random_forest_confusion_matrix <- make_confusion_matrix(
+  predicted = random_forest_prediction,
+  actual = evaluation_actual
+)
+
+xgboost_confusion_matrix <- make_confusion_matrix(
+  predicted = xgboost_prediction,
+  actual = evaluation_actual
+)
+
+confusion_metric_summary <- bind_rows(
+  evaluate_model("Naive Bayes", evaluation_actual, naive_prediction, naive_probability),
+  evaluate_model("Complement Naive Bayes", evaluation_actual, complement_naive_prediction, complement_naive_probability),
+  evaluate_model("KNN baseline", evaluation_actual, knn_base_prediction, knn_base_probability),
+  evaluate_model("KNN downsampled", evaluation_actual, knn_down_prediction, knn_down_probability),
+  evaluate_model("Logistic Regression", evaluation_actual, logistic_regression_prediction, logistic_regression_probability),
+  evaluate_model("Decision Tree", evaluation_actual, decision_tree_prediction, decision_tree_probability),
+  evaluate_model("Random Forest", evaluation_actual, random_forest_prediction, random_forest_probability),
+  evaluate_model("XGBoost", evaluation_actual, xgboost_prediction, xgboost_probability)
+) %>%
+  mutate(across(where(is.numeric), ~ round(.x, 4))) %>%
+  arrange(desc(AUC))
+
+kable(
+  confusion_metric_summary,
+  caption = "Metric check rebuilt from the same confusion matrix inputs"
+)
+
+naive_confusion_matrix
+complement_naive_confusion_matrix
+knn_base_confusion_matrix
+knn_down_confusion_matrix
+logistic_confusion_matrix
+decision_tree_confusion_matrix
+random_forest_confusion_matrix
+xgboost_confusion_matrix
+```
+
+# Model Interpretation And Variable Importance
+
+```{r variable-importance}
+# Logistic Regression coefficients
+logistic_coefficients <- summary(logistic_regression_model)$coefficients
+
+# Decision Tree variable importance
+decision_tree_importance <- varImp(decision_tree_model)
+
+# Random Forest variable importance
+random_forest_importance <- varImp(random_forest_model)
+
+# XGBoost variable importance
+xgboost_importance <- xgb.importance(
+  model = xgboost_model
+)
+
+logistic_coefficients
+decision_tree_importance
+random_forest_importance
+xgboost_importance
+```
+
+# Save Outputs
+
+```{r save-outputs}
+write_csv(model_comparison, file.path(output_dir, "model_comparison.csv"))
+write_csv(missing_table, file.path(output_dir, "missing_table.csv"))
+
+saveRDS(naive_model, file.path(output_dir, "naive_bayes_model.rds"))
+saveRDS(complement_naive_model, file.path(output_dir, "complement_naive_bayes_model.rds"))
+saveRDS(knn_dummy_model, file.path(output_dir, "knn_dummy_model.rds"))
+saveRDS(knn_scale_model, file.path(output_dir, "knn_scale_model.rds"))
+saveRDS(knn_model_base, file.path(output_dir, "knn_baseline_model.rds"))
+saveRDS(knn_model_down, file.path(output_dir, "knn_downsampled_model.rds"))
+saveRDS(logistic_regression_model, file.path(output_dir, "logistic_regression_model.rds"))
+saveRDS(decision_tree_model, file.path(output_dir, "decision_tree_model.rds"))
+saveRDS(random_forest_model, file.path(output_dir, "random_forest_model.rds"))
+saveRDS(xgboost_model, file.path(output_dir, "xgboost_model.rds"))
+
+cat("Outputs saved to:", normalizePath(output_dir), "\n")
+```
