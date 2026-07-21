@@ -34,6 +34,7 @@ library(randomForest)
 library(xgboost)
 library(class)
 library(knitr)
+library(kernelshap)
 
 SEED <- 123
 TRAIN_PROPORTION <- 0.70
@@ -581,6 +582,24 @@ model_population_summary <- bind_rows(
 kable(model_population_summary, caption = "Final modelling data class balance")
 
 kable(product_model_summary, caption = "Product-specific modelling subsets")
+
+# Save one reusable handoff file for downstream modelling documents. This lets
+# later RMDs load the prepared datasets without repeating data cleaning.
+prepared_modelling_objects <- list(
+  model_data = model_data,
+  naive_data_final = naive_data_final,
+  knn_data_final = knn_data_final,
+  tree_data_final = tree_data_final,
+  product_model_data = product_model_data,
+  product_model_summary = product_model_summary,
+  model_population_summary = model_population_summary,
+  id_columns = id_columns
+)
+
+saveRDS(
+  prepared_modelling_objects,
+  file.path(output_dir, "prepared_modelling_objects.rds")
+)
 ```
 
 # Helper Functions
@@ -1188,14 +1207,31 @@ decision_tree_prediction <- probability_to_class(
 ```{r random-forest-model, message=FALSE, warning=FALSE}
 set.seed(SEED)
 
+# Random Forest uses its own resampling control so this chunk does not depend
+# on the Decision Tree control object. Saved out-of-fold probabilities are
+# required for the later Max-F1 threshold analysis.
+rf_control <- trainControl(
+  method = "cv",
+  number = 3,
+  classProbs = TRUE,
+  summaryFunction = twoClassSummary,
+  savePredictions = "final"
+)
+
 rf_mtry_grid <- expand.grid(
-  mtry = unique(pmax(
-    1,
-    round(c(
-      sqrt(ncol(train_data) - 1),
-      (ncol(train_data) - 1) / 4
-    ))
-  ))
+  mtry = sort(unique(pmin(
+    ncol(train_data) - 1,
+    pmax(
+      1,
+      c(
+        2,
+        4,
+        6,
+        8,
+        floor(sqrt(ncol(train_data) - 1))
+      )
+    )
+  )))
 )
 
 random_forest_model <- train(
@@ -1203,10 +1239,46 @@ random_forest_model <- train(
   data = train_data,
   method = "rf",
   metric = "ROC",
-  trControl = tree_tune_control,
+  trControl = rf_control,
   tuneGrid = rf_mtry_grid,
-  ntree = 75,
+  ntree = 100,
   importance = TRUE
+)
+
+# Report the cross-validated mtry selected by ROC-AUC.
+random_forest_model$bestTune
+
+# Prevent an older direct randomForest() object remaining in the R session from
+# being saved under the new caret-model filename.
+if (!inherits(random_forest_model, "train")) {
+  stop(
+    "random_forest_model is an older model in the current R session. Restart R and run the complete Random Forest chunk, including caret::train()."
+  )
+}
+
+rf_model_predictors <- attr(
+  random_forest_model$terms,
+  "term.labels"
+)
+
+rf_missing_predictors <- setdiff(
+  rf_model_predictors,
+  names(test_data)
+)
+
+if (length(rf_missing_predictors) > 0) {
+  stop(
+    "The fitted Random Forest expects predictors not found in the current test data: ",
+    paste(rf_missing_predictors, collapse = ", "),
+    ". Restart R and run the data and Random Forest chunks again."
+  )
+}
+
+# Save the current 100-tree caret model immediately after fitting. A distinct
+# filename prevents an older direct randomForest() object from being reused.
+saveRDS(
+  random_forest_model,
+  file.path(output_dir, "random_forest_caret_100_trees.rds")
 )
 
 random_forest_probability <- predict(
@@ -1646,8 +1718,308 @@ saveRDS(knn_model_base, file.path(output_dir, "knn_baseline_model.rds"))
 saveRDS(knn_model_down, file.path(output_dir, "knn_downsampled_model.rds"))
 saveRDS(logistic_regression_model, file.path(output_dir, "logistic_regression_model.rds"))
 saveRDS(decision_tree_model, file.path(output_dir, "decision_tree_model.rds"))
-saveRDS(random_forest_model, file.path(output_dir, "random_forest_model.rds"))
 saveRDS(xgboost_model, file.path(output_dir, "xgboost_model.rds"))
 
 cat("Outputs saved to:", normalizePath(output_dir), "\n")
+```
+
+# Random Forest Max-F1 Threshold Tuning
+
+This section reuses the existing `random_forest_model` and its saved
+cross-validation predictions. The model is **not fitted again**. The Max-F1
+threshold is selected from out-of-fold training probabilities and is then
+compared with the original threshold of 0.50 on the untouched test set.
+
+```{r random-forest-max-f1, message=FALSE, warning=FALSE}
+rf_threshold_metrics <- function(actual, probability, threshold) {
+  predicted <- probability_to_class(probability, threshold)
+  confusion <- confusionMatrix(predicted, actual, positive = "Yes")
+
+  tibble(
+    Threshold = threshold,
+    Accuracy = unname(confusion$overall["Accuracy"]),
+    Sensitivity = unname(confusion$byClass["Sensitivity"]),
+    Specificity = unname(confusion$byClass["Specificity"]),
+    Precision = unname(confusion$byClass["Pos Pred Value"]),
+    F1 = unname(confusion$byClass["F1"]),
+    Balanced_Accuracy = unname(
+      confusion$byClass["Balanced Accuracy"]
+    ),
+    Predicted_NEOS_Rate = mean(predicted == "Yes")
+  )
+}
+
+# Keep only out-of-fold probabilities from the cross-validated mtry selected
+# by caret. These probabilities were generated during the existing RF fit.
+rf_oof_predictions <- random_forest_model$pred %>%
+  filter(mtry == random_forest_model$bestTune$mtry) %>%
+  arrange(rowIndex)
+
+rf_threshold_curve <- map_dfr(
+  seq(0.01, 0.80, by = 0.01),
+  ~ rf_threshold_metrics(
+    actual = factor(rf_oof_predictions$obs, levels = c("Yes", "No")),
+    probability = rf_oof_predictions$Yes,
+    threshold = .x
+  )
+)
+
+rf_max_f1_result <- rf_threshold_curve %>%
+  filter(!is.na(F1)) %>%
+  arrange(desc(F1), desc(Sensitivity), desc(Precision)) %>%
+  slice_head(n = 1)
+
+rf_max_f1_threshold <- rf_max_f1_result$Threshold[[1]]
+
+kable(
+  rf_max_f1_result,
+  digits = 4,
+  caption = "Random Forest Max-F1 threshold from out-of-fold training predictions"
+)
+```
+
+## Random Forest Threshold Curve
+
+```{r random-forest-f1-curve, fig.width=9, fig.height=5}
+ggplot(rf_threshold_curve, aes(x = Threshold, y = F1)) +
+  geom_line(colour = "#5487BE", linewidth = 0.9) +
+  geom_vline(
+    xintercept = rf_max_f1_threshold,
+    colour = "#173B67",
+    linetype = "dashed",
+    linewidth = 0.8
+  ) +
+  labs(
+    title = "Random Forest Max-F1 Threshold Selection",
+    subtitle = paste0(
+      "Selected threshold = ",
+      round(rf_max_f1_threshold, 3)
+    ),
+    x = "Probability threshold",
+    y = "Out-of-fold F1 score"
+  ) +
+  theme_minimal()
+```
+
+## Test-Set Comparison: 0.50 versus Max-F1
+
+```{r random-forest-threshold-comparison}
+rf_evaluation_actual <- factor(
+  as.character(test_data$neos_flag),
+  levels = c("Yes", "No")
+)
+
+rf_roc_result <- roc(
+  response = rf_evaluation_actual,
+  predictor = random_forest_probability,
+  levels = c("No", "Yes"),
+  direction = "<",
+  quiet = TRUE
+)
+
+rf_threshold_comparison <- bind_rows(
+  rf_threshold_metrics(
+    rf_evaluation_actual,
+    random_forest_probability,
+    0.50
+  ) %>% mutate(Threshold_Method = "Standard 0.50"),
+  rf_threshold_metrics(
+    rf_evaluation_actual,
+    random_forest_probability,
+    rf_max_f1_threshold
+  ) %>% mutate(Threshold_Method = "Max-F1")
+) %>%
+  mutate(
+    AUC = as.numeric(auc(rf_roc_result)),
+    across(where(is.numeric), ~ round(.x, 4))
+  ) %>%
+  dplyr::select(Threshold_Method, Threshold, AUC, everything())
+
+kable(
+  rf_threshold_comparison,
+  caption = "Random Forest test performance: threshold 0.50 versus Max-F1"
+)
+
+rf_prediction_050 <- probability_to_class(
+  random_forest_probability,
+  0.50
+)
+
+rf_prediction_max_f1 <- probability_to_class(
+  random_forest_probability,
+  rf_max_f1_threshold
+)
+
+rf_confusion_matrix_050 <- confusionMatrix(
+  rf_prediction_050,
+  rf_evaluation_actual,
+  positive = "Yes"
+)
+
+rf_confusion_matrix_max_f1 <- confusionMatrix(
+  rf_prediction_max_f1,
+  rf_evaluation_actual,
+  positive = "Yes"
+)
+
+rf_confusion_matrix_050
+rf_confusion_matrix_max_f1
+```
+
+## Sensitivity and Precision Trade-off
+
+```{r random-forest-threshold-chart, fig.width=9, fig.height=5}
+rf_threshold_comparison %>%
+  dplyr::select(Threshold_Method, Sensitivity, Precision) %>%
+  pivot_longer(
+    cols = c(Sensitivity, Precision),
+    names_to = "Metric",
+    values_to = "Value"
+  ) %>%
+  ggplot(aes(x = Metric, y = Value, fill = Threshold_Method)) +
+  geom_col(position = position_dodge(width = 0.75), width = 0.68) +
+  geom_text(
+    aes(label = scales::percent(Value, accuracy = 0.1)),
+    position = position_dodge(width = 0.75),
+    vjust = -0.35,
+    size = 3.5
+  ) +
+  scale_y_continuous(
+    labels = scales::percent_format(),
+    limits = c(0, 1.05)
+  ) +
+  scale_fill_manual(values = c(
+    "Standard 0.50" = "#9BBAD5",
+    "Max-F1" = "#173B67"
+  )) +
+  labs(
+    title = "Random Forest Operating Threshold Trade-off",
+    x = NULL,
+    y = "Test-set performance",
+    fill = NULL
+  ) +
+  theme_minimal() +
+  theme(legend.position = "top")
+```
+
+# Random Forest SHAP Explanation
+
+SHAP explains how each feature contributes to the existing Random Forest's
+predicted NEOS probability. It explains model behaviour and does not establish
+causality. To control runtime, SHAP uses 100 test observations and 100 training
+background observations.
+
+```{r random-forest-shap, message=FALSE, warning=FALSE}
+set.seed(SEED)
+
+rf_train_features <- train_data %>% dplyr::select(-neos_flag)
+rf_test_features <- test_data %>% dplyr::select(-neos_flag)
+
+rf_shap_explanation_data <- rf_test_features %>%
+  slice_sample(n = min(100, n()))
+
+rf_shap_background_data <- rf_train_features %>%
+  slice_sample(n = min(100, n()))
+
+rf_neos_probability <- function(object, newdata) {
+  predict(object, newdata = newdata, type = "prob")[, "Yes"]
+}
+
+rf_shap_result <- kernelshap(
+  object = random_forest_model,
+  X = rf_shap_explanation_data,
+  bg_X = rf_shap_background_data,
+  pred_fun = rf_neos_probability,
+  exact = FALSE,
+  hybrid_degree = 1,
+  tol = 0.02,
+  max_iter = 20,
+  verbose = FALSE,
+  seed = SEED
+)
+
+rf_shap_values <- as.data.frame(rf_shap_result$S)
+```
+
+## Global SHAP Importance
+
+```{r random-forest-global-shap, fig.width=9, fig.height=6}
+rf_global_shap_importance <- tibble(
+  Feature = names(rf_shap_values),
+  Mean_Absolute_SHAP = map_dbl(
+    rf_shap_values,
+    ~ mean(abs(.x), na.rm = TRUE)
+  )
+) %>%
+  arrange(desc(Mean_Absolute_SHAP))
+
+kable(
+  rf_global_shap_importance %>% slice_head(n = 15),
+  digits = 4,
+  caption = "Top Random Forest drivers by mean absolute SHAP value"
+)
+
+rf_global_shap_importance %>%
+  slice_head(n = 15) %>%
+  ggplot(aes(
+    x = fct_reorder(Feature, Mean_Absolute_SHAP),
+    y = Mean_Absolute_SHAP
+  )) +
+  geom_col(fill = "#173B67", width = 0.68) +
+  coord_flip() +
+  labs(
+    title = "Random Forest Global SHAP Importance",
+    subtitle = "Larger values indicate greater influence on predicted NEOS probability",
+    x = NULL,
+    y = "Mean absolute SHAP value"
+  ) +
+  theme_minimal()
+```
+
+## Individual SHAP Explanation
+
+```{r random-forest-individual-shap}
+rf_individual_shap <- tibble(
+  Feature = names(rf_shap_values),
+  SHAP_Value = as.numeric(rf_shap_values[1, ])
+) %>%
+  mutate(Direction = if_else(
+    SHAP_Value >= 0,
+    "Pushes toward NEOS",
+    "Pushes away from NEOS"
+  )) %>%
+  arrange(desc(abs(SHAP_Value))) %>%
+  slice_head(n = 10)
+
+kable(
+  rf_individual_shap,
+  digits = 4,
+  caption = "Top SHAP contributions for one example test observation"
+)
+```
+
+# Save Random Forest Threshold and SHAP Outputs
+
+```{r save-random-forest-threshold-shap}
+write_csv(
+  rf_threshold_comparison,
+  file.path(output_dir, "random_forest_threshold_050_vs_max_f1.csv")
+)
+
+write_csv(
+  rf_threshold_curve,
+  file.path(output_dir, "random_forest_f1_threshold_curve.csv")
+)
+
+write_csv(
+  rf_global_shap_importance,
+  file.path(output_dir, "random_forest_global_shap_importance.csv")
+)
+
+saveRDS(
+  rf_shap_result,
+  file.path(output_dir, "random_forest_shap_result.rds")
+)
+
+cat("Random Forest threshold and SHAP outputs saved to:", normalizePath(output_dir), "\n")
 ```
